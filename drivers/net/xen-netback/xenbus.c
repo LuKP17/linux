@@ -1116,6 +1116,12 @@ static int netback_probe(struct xenbus_device *dev,
 	if (err)
 		pr_debug("Error writing feature-split-event-channels\n");
 
+	/* Persistent grants support, this is an optional feature */
+	err = xenbus_printf(XBT_NIL, dev->nodename,
+				"feature-persistent", "%d", xenvif_max_pgrants > 0);
+	if (err)
+		pr_debug("Error writing feature-persistent\n");
+
 	/* Multi-queue support: This is an optional feature. */
 	err = xenbus_printf(XBT_NIL, dev->nodename,
 			    "multi-queue-max-queues", "%u", xenvif_max_queues);

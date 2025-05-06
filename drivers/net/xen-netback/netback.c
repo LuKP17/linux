@@ -75,7 +75,7 @@ MODULE_PARM_DESC(max_queues,
 
 /*
  * Maximum number of grants to map persistently in netback.
- * L17 TODO: test performance with different values.
+ * L17 TODO: test performance with higher values.
  */
 unsigned int xenvif_max_pgrants = XEN_NETIF_RX_RING_SIZE;
 module_param_named(max_persistent_grants, xenvif_max_pgrants, int, 0644);
