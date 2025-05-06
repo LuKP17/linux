@@ -408,6 +408,7 @@ extern bool provides_xdp_headroom;
 extern unsigned int rx_drain_timeout_msecs;
 extern unsigned int rx_stall_timeout_msecs;
 extern unsigned int xenvif_max_queues;
+extern unsigned int xenvif_max_pgrants;
 extern unsigned int xenvif_hash_cache_size;
 
 #ifdef CONFIG_DEBUG_FS
