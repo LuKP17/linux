@@ -74,6 +74,12 @@ MODULE_PARM_DESC(max_queues,
 		 "Maximum number of queues per virtual interface");
 
 /*
+ * Maximum number of grants to map persistently in netback.
+ * L17 TODO: test performance with different values.
+ */
+unsigned int xenvif_max_pgrants = XEN_NETIF_RX_RING_SIZE;
+
+/*
  * This is the maximum slots a skb can have. If a guest sends a skb
  * which exceeds this limit it is considered malicious.
  */
@@ -1757,6 +1763,8 @@ static int __init netback_init(void)
 	if (xenvif_max_queues == 0)
 		xenvif_max_queues = min_t(unsigned int, MAX_QUEUES_DEFAULT,
 					  num_online_cpus());
+
+	pr_info("max persistent grants: %d\n", xenvif_max_pgrants);
 
 	if (fatal_skb_slots < XEN_NETBK_LEGACY_SLOTS_MAX) {
 		pr_info("fatal_skb_slots too small (%d), bump it to XEN_NETBK_LEGACY_SLOTS_MAX (%d)\n",
