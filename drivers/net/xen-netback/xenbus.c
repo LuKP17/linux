@@ -972,6 +972,9 @@ static int read_xenbus_vif_flags(struct backend_info *be)
 	vif->ipv6_csum = !!xenbus_read_unsigned(dev->otherend,
 						"feature-ipv6-csum-offload", 0);
 
+	vif->persistent_grants = xenvif_max_pgrants &&
+		xenbus_read_unsigned(dev->otherend, "feature-persistent", 0);
+
 	read_xenbus_frontend_xdp(be, dev);
 
 	return 0;

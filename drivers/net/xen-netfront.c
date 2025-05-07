@@ -174,6 +174,9 @@ struct netfront_info {
 	bool netback_has_xdp_headroom;
 	bool netfront_xdp_enabled;
 
+	/* Persistent grants */
+	bool persistent_grants;
+
 	/* Is device behaving sane? */
 	bool broken;
 
@@ -2268,6 +2271,10 @@ static int talk_to_netback(struct xenbus_device *dev,
 	info->bounce = !xennet_trusted ||
 		       !xenbus_read_unsigned(dev->nodename, "trusted", 1);
 
+	/* Check if backend supports persistent grants */
+	info->persistent_grants = !!xenbus_read_unsigned(info->xbdev->otherend,
+								"feature-persistent", 0);
+
 	/* Check if backend supports multiple queues */
 	max_queues = xenbus_read_unsigned(info->xbdev->otherend,
 					  "multi-queue-max-queues", 1);
@@ -2388,6 +2395,13 @@ again:
 			   "1");
 	if (err) {
 		message = "writing feature-ipv6-csum-offload";
+		goto abort_transaction;
+	}
+
+	// L17 TODO: decide if having a persistent mod param like netback is useful
+	err = xenbus_write(xbt, dev->nodename, "feature-persistent", "1"); 
+	if (err) {
+		message = "writing feature-persistent";
 		goto abort_transaction;
 	}
 

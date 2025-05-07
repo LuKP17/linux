@@ -291,6 +291,7 @@ struct xenvif {
 	u8 can_sg:1;
 	u8 ip_csum:1;
 	u8 ipv6_csum:1;
+	u8 persistent_grants:1;
 	u8 multicast_control:1;
 
 	/* headroom requested by xen-netfront */
