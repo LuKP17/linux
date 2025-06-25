@@ -434,17 +434,22 @@ static bool xennet_tx_buf_gc(struct netfront_queue *queue)
 			queue->tx_link[id] = TX_LINK_NONE;
 			skb = queue->tx_skbs[id];
 			queue->tx_skbs[id] = NULL;
-			if (unlikely(!gnttab_end_foreign_access_ref(
-				queue->grant_tx_ref[id]))) {
-				dev_alert(dev,
-					  "Grant still in use by backend domain\n");
-				goto err;
+			
+			if (!queue->info->persistent_grants) {
+				if (unlikely(!gnttab_end_foreign_access_ref(
+					queue->grant_tx_ref[id]))) {
+					dev_alert(dev,
+						"Grant still in use by backend domain\n");
+					goto err;
+				}
+				gnttab_release_grant_reference(
+					&queue->gref_tx_head, queue->grant_tx_ref[id]);
+				printk("[queue %d] xennet_tx_buf_gc(): ungranted and released with gref %u\n", queue->id, queue->grant_tx_ref[id]);
+				queue->grant_tx_ref[id] = INVALID_GRANT_REF;
+				queue->grant_tx_page[id] = NULL;
 			}
-			gnttab_release_grant_reference(
-				&queue->gref_tx_head, queue->grant_tx_ref[id]);
-			queue->grant_tx_ref[id] = INVALID_GRANT_REF;
-			queue->grant_tx_page[id] = NULL;
 			add_id_to_list(&queue->tx_skb_freelist, queue->tx_link, id);
+			printk("[queue %d] xennet_tx_buf_gc(): added id %u to freelist\n", queue->id, id);
 			dev_kfree_skb_irq(skb);
 		}
 
@@ -486,19 +491,35 @@ static void xennet_tx_setup_grant(unsigned long gfn, unsigned int offset,
 	struct sk_buff *skb = info->skb;
 
 	id = get_id_from_list(&queue->tx_skb_freelist, queue->tx_link);
+	printk("[queue %d] xennet_tx_setup_grant(): got id %u from freelist\n", queue->id, id);
 	tx = RING_GET_REQUEST(&queue->tx, queue->tx.req_prod_pvt++);
-	ref = gnttab_claim_grant_reference(&queue->gref_tx_head);
-	WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
 
-	gnttab_grant_foreign_access_ref(ref, queue->info->xbdev->otherend_id,
-					gfn, GNTMAP_readonly);
+	/* Reuse claimed grants */
+	if (queue->grant_tx_ref[id] == INVALID_GRANT_REF) {
+		ref = gnttab_claim_grant_reference(&queue->gref_tx_head);
+		WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
+
+		gnttab_grant_foreign_access_ref(ref, queue->info->xbdev->otherend_id,
+						gfn, GNTMAP_readonly);
+
+		queue->grant_tx_ref[id] = ref;
+		printk("[queue %d] xennet_tx_setup_grant(): claimed and granted with gref %u\n", queue->id, queue->grant_tx_ref[id]);
+	}
+
+	if (queue->info->persistent_grants) {
+		/* Reuse granted pages */
+		memcpy(pfn_to_kaddr(page_to_pfn(queue->grant_tx_page[id])) + offset,
+				pfn_to_kaddr(page_to_pfn(page)) + offset, len);
+		printk("[queue %d] xennet_tx_setup_grant(): memcpy'd client buf into page\n",
+					queue->id);
+	} else {
+		queue->grant_tx_page[id] = page;
+	}
 
 	queue->tx_skbs[id] = skb;
-	queue->grant_tx_page[id] = page;
-	queue->grant_tx_ref[id] = ref;
 
 	info->tx_local.id = id;
-	info->tx_local.gref = ref;
+	info->tx_local.gref = queue->grant_tx_ref[id];
 	info->tx_local.offset = offset;
 	info->tx_local.size = len;
 	info->tx_local.flags = 0;
@@ -2043,8 +2064,10 @@ static int xennet_init_queue(struct netfront_queue *queue)
 	for (i = 0; i < NET_TX_RING_SIZE; i++) {
 		queue->tx_link[i] = i + 1;
 		queue->grant_tx_ref[i] = INVALID_GRANT_REF;
-		queue->grant_tx_page[i] = NULL;
+		queue->grant_tx_page[i] = queue->info->persistent_grants ?
+										alloc_page(GFP_NOIO) : NULL;
 	}
+	printk("[queue %d] xennet_init_queue(): refs and pool pages initialized\n", queue->id);
 	queue->tx_link[NET_TX_RING_SIZE - 1] = TX_LINK_NONE;
 
 	/* Clear out rx_skbs */
