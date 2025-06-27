@@ -2301,7 +2301,9 @@ static int talk_to_netback(struct xenbus_device *dev,
 	/* Check if backend supports multiple queues */
 	max_queues = xenbus_read_unsigned(info->xbdev->otherend,
 					  "multi-queue-max-queues", 1);
-	num_queues = min(max_queues, xennet_max_queues);
+	//num_queues = min(max_queues, xennet_max_queues);
+	// L17 TEST remove when it works with a single queue
+	num_queues = 1;
 
 	/* Check feature-split-event-channels */
 	feature_split_evtchn = xenbus_read_unsigned(info->xbdev->otherend,

@@ -132,6 +132,14 @@ struct xenvif_copy_state {
 	struct sk_buff_head *completed;
 };
 
+struct persistent_gnt {
+	struct page *page;
+	grant_ref_t gnt;
+	grant_handle_t handle;
+	bool active;
+	struct rb_node node;
+};
+
 struct xenvif_queue { /* Per-queue data for xenvif */
 	unsigned int id; /* Queue ID, 0-based */
 	char name[QUEUE_NAME_SIZE]; /* DEVNAME-qN */
@@ -212,6 +220,12 @@ struct xenvif_queue { /* Per-queue data for xenvif */
 	struct timer_list credit_timeout;
 	u64 credit_window_start;
 	bool rate_limited;
+
+	/* Persistent grants */
+	struct rb_root	persistent_gnts;
+	unsigned int	persistent_gnt_c;
+	struct gnttab_page_cache persistent_pages;
+	struct persistent_gnt *tx_pgrants[MAX_PENDING_REQS];
 
 	/* Statistics */
 	struct xenvif_stats stats;
@@ -418,11 +432,15 @@ extern struct dentry *xen_netback_dbg_root;
 
 void xenvif_skb_zerocopy_prepare(struct xenvif_queue *queue,
 				 struct sk_buff *skb);
-void xenvif_skb_zerocopy_complete(struct xenvif_queue *queue);
+void xenvif_skb_zerocopy_complete(struct xenvif_queue *queue,
+				 unsigned int pending_dealloc);
 
 /* Multicast control */
 bool xenvif_mcast_match(struct xenvif *vif, const u8 *addr);
 void xenvif_mcast_addr_list_free(struct xenvif *vif);
+
+/* Persistent grants */
+void xenvif_pgrants_destroy(struct xenvif_queue *queue);
 
 /* Hash */
 void xenvif_init_hash(struct xenvif *vif);
