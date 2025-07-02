@@ -956,10 +956,10 @@ check_frags:
 		}
 
 		/* Check error status: if okay then remember grant handle. */
-		printk("[queue %u] xenvif_tx_check_gop(): frag map at pending_index %u with gref %u was successful\n", queue->id, pending_idx, gop_map->ref);
 		newerr = gop_map->status;
 
 		if (likely(!newerr)) {
+			printk("[queue %u] xenvif_tx_check_gop(): frag map at pending_index %u with gref %u was successful\n", queue->id, pending_idx, gop_map->ref);
 			xenvif_grant_handle_set(queue,
 						pending_idx,
 						gop_map->handle);

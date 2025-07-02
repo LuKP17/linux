@@ -499,6 +499,9 @@ static void xennet_tx_setup_grant(unsigned long gfn, unsigned int offset,
 		ref = gnttab_claim_grant_reference(&queue->gref_tx_head);
 		WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
 
+		if (queue->info->persistent_grants)
+			gfn = pfn_to_gfn(page_to_xen_pfn(queue->grant_tx_page[id]));
+
 		gnttab_grant_foreign_access_ref(ref, queue->info->xbdev->otherend_id,
 						gfn, GNTMAP_readonly);
 
@@ -508,8 +511,9 @@ static void xennet_tx_setup_grant(unsigned long gfn, unsigned int offset,
 
 	if (queue->info->persistent_grants) {
 		/* Reuse granted pages */
-		memcpy(pfn_to_kaddr(page_to_pfn(queue->grant_tx_page[id])) + offset,
+		memcpy(pfn_to_kaddr(page_to_pfn(queue->grant_tx_page[id])),
 				pfn_to_kaddr(page_to_pfn(page)) + offset, len);
+		offset = 0; // worried that offsets will introduce bleeding
 		printk("[queue %d] xennet_tx_setup_grant(): memcpy'd client buf into page\n",
 					queue->id);
 	} else {
@@ -2301,9 +2305,7 @@ static int talk_to_netback(struct xenbus_device *dev,
 	/* Check if backend supports multiple queues */
 	max_queues = xenbus_read_unsigned(info->xbdev->otherend,
 					  "multi-queue-max-queues", 1);
-	//num_queues = min(max_queues, xennet_max_queues);
-	// L17 TEST remove when it works with a single queue
-	num_queues = 1;
+	num_queues = min(max_queues, xennet_max_queues);
 
 	/* Check feature-split-event-channels */
 	feature_split_evtchn = xenbus_read_unsigned(info->xbdev->otherend,
