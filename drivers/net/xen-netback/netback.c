@@ -583,7 +583,6 @@ struct xenvif_tx_cb {
 	u16 copy_pending_idx[XEN_NETBK_LEGACY_SLOTS_MAX + 1];
 	u8 copy_count;
 	u32 split_mask;
-	u8 header_map_count;
 };
 
 #define XENVIF_TX_CB(skb) ((struct xenvif_tx_cb *)(skb)->cb)
@@ -651,31 +650,11 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 
 	copy_count(skb) = 0;
 	XENVIF_TX_CB(skb)->split_mask = 0;
-	XENVIF_TX_CB(skb)->header_map_count = 0;
-
-	//printk("=============== data_len: %u bytes to copy\n", data_len);
-	//printk("=============== first request size: %u bytes, gref: %u\n", txp->size, txp->gref);
-
-	if (use_pgrants) {
-		pgrant = get_persistent_gnt(queue, txp->gref);
-		if (pgrant)
-			put_persistent_gnt(queue, pgrant);
-	}
 
 	/* Create copy ops for exactly data_len bytes into the skb head. */
 	__skb_put(skb, data_len);
 	while (data_len > 0) {
 		int amount = data_len > txp->size ? txp->size : data_len;
-		index = pending_index(queue->pending_cons);
-		pending_idx = queue->pending_ring[index];
-
-		if (use_pgrants && !pgrant && (amount == txp->size)) {
-			printk("[queue %u] xenvif_get_requests(): request with gref %u will be covered by copies and isn't a pgrant\n", queue->id, txp->gref);
-			page = get_free_page(queue, use_pgrants, pending_idx);
-			xenvif_tx_create_map_op(queue, txp, page, gop++);
-			XENVIF_TX_CB(skb)->header_map_count++;
-		}
-
 		bool split = false;
 
 		cop->source.u.ref = txp->gref;
@@ -699,6 +678,9 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 		cop->len = amount;
 		cop->flags = GNTCOPY_source_gref;
 
+		index = pending_index(queue->pending_cons);
+		pending_idx = queue->pending_ring[index];
+
 		callback_param(queue, pending_idx).ctx = NULL;
 		copy_pending_idx(skb, copy_count(skb)) = pending_idx;
 		if (!split)
@@ -716,20 +698,13 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 			queue->pending_tx_info[pending_idx].extra_count =
 				(txp == first) ? extra_count : 0;
 
-			if (txp == first) {
+			if (txp == first)
 				txp = txfrags;
-				//printk("=============== first request covered with copies, next request size: %u bytes, gref: %u, %u bytes left to copy\n", txp->size, txp->gref, data_len);
-			} else {
+			else
 				txp++;
-				//printk("=============== another request covered with copies, next request size: %u bytes, gref: %u, %u bytes left to copy\n", txp->size, txp->gref, data_len);
-			}
+
 			queue->pending_cons++;
 			nr_slots--;
-			if (use_pgrants && nr_slots > 0) {
-				pgrant = get_persistent_gnt(queue, txp->gref);
-				if (pgrant)
-					put_persistent_gnt(queue, pgrant);
-			}
 		} else {
 			/* The copy op partially covered the tx_request.
 			 * The remainder will be mapped or copied in the next
@@ -739,7 +714,6 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 						queue->id, txp->gref);
 			txp->offset += amount;
 			txp->size -= amount;
-			//printk("=============== request partially covered with copies, %u bytes left to copy\n", data_len);
 		}
 	}
 
@@ -835,7 +809,7 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 	(*copy_ops) = cop - queue->tx_copy_ops;
 	(*map_ops) = gop - queue->tx_map_ops;
 
-	printk("[queue %u] xenvif_get_requests(): finished creating maps! (%u for skb header)\n", queue->id, XENVIF_TX_CB(skb)->header_map_count);
+	printk("[queue %u] xenvif_get_requests(): finished creating maps!\n", queue->id);
 }
 
 static inline void xenvif_grant_handle_set(struct xenvif_queue *queue,
@@ -889,7 +863,7 @@ static int xenvif_tx_check_gop(struct xenvif_queue *queue,
 				frag_get_pending_idx(&shinfo->frags[0]) ==
 				    copy_pending_idx(skb, copy_count(skb) - 1);
 	struct persistent_gnt *pgrant;
-	int i, newerr, err = 0;
+	int i, err = 0;
 
 	for (i = 0; i < copy_count(skb); i++) {
 		int newerr;
@@ -926,21 +900,9 @@ static int xenvif_tx_check_gop(struct xenvif_queue *queue,
 		(*gopp_copy)++;
 	}
 
-	// the first gop_maps could be for the first requests, use a counter in skb->cb
-	// to know how many gop_maps are not for the frags to create pgrants here
-	// and increment gop_map to the right value for check_frags
-	for (i = 0; i < XENVIF_TX_CB(skb)->header_map_count; i++, gop_map++) {
-		newerr = gop_map->status;
-		WARN_ON(newerr); // not handling errors yet
-		printk("[queue %u] xenvif_tx_check_gop(): header map with gref %u was successful\n", queue->id, gop_map->ref);
-		pgrant = xenvif_pgrant_new(queue, gop_map);
-		if (pgrant)
-			put_persistent_gnt(queue, pgrant);
-	}
-
 check_frags:
 	for (i = 0; i < nr_frags; i++, gop_map++) {
-		int j;
+		int j, newerr;
 
 		pending_idx = frag_get_pending_idx(&shinfo->frags[i]);
 		// if there is a pgrant at pending_idx, set grant handle and continue
