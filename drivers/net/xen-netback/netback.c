@@ -1036,7 +1036,7 @@ static void xenvif_fill_frags(struct xenvif_queue *queue, struct sk_buff *skb)
 			printk("[queue %u] xenvif_fill_frags(): associated pgrant: gref %u, handle %u\n", queue->id, pgrant->gnt, pgrant->handle);
 		else
 			printk("[queue %u] xenvif_fill_frags(): associated pgrant: NONE\n", queue->id);
-		page = pgrant ? pgrant->page : virt_to_page(idx_to_kaddr(queue, pending_idx));
+		page = pgrant ? pgrant->page : queue->mmap_pages[pending_idx];
 		__skb_fill_page_desc(skb, i, page, txp->offset, txp->size);
 		skb->len += txp->size;
 		skb->data_len += txp->size;
