@@ -444,12 +444,10 @@ static bool xennet_tx_buf_gc(struct netfront_queue *queue)
 				}
 				gnttab_release_grant_reference(
 					&queue->gref_tx_head, queue->grant_tx_ref[id]);
-				printk("[queue %d] xennet_tx_buf_gc(): ungranted and released with gref %u\n", queue->id, queue->grant_tx_ref[id]);
 				queue->grant_tx_ref[id] = INVALID_GRANT_REF;
 				queue->grant_tx_page[id] = NULL;
 			}
 			add_id_to_list(&queue->tx_skb_freelist, queue->tx_link, id);
-			printk("[queue %d] xennet_tx_buf_gc(): added id %u to freelist\n", queue->id, id);
 			dev_kfree_skb_irq(skb);
 		}
 
@@ -491,7 +489,6 @@ static void xennet_tx_setup_grant(unsigned long gfn, unsigned int offset,
 	struct sk_buff *skb = info->skb;
 
 	id = get_id_from_list(&queue->tx_skb_freelist, queue->tx_link);
-	printk("[queue %d] xennet_tx_setup_grant(): got id %u from freelist\n", queue->id, id);
 	tx = RING_GET_REQUEST(&queue->tx, queue->tx.req_prod_pvt++);
 
 	/* Reuse claimed grants */
@@ -506,7 +503,6 @@ static void xennet_tx_setup_grant(unsigned long gfn, unsigned int offset,
 						gfn, GNTMAP_readonly);
 
 		queue->grant_tx_ref[id] = ref;
-		printk("[queue %d] xennet_tx_setup_grant(): claimed and granted with gref %u\n", queue->id, queue->grant_tx_ref[id]);
 	}
 
 	if (queue->info->persistent_grants) {
@@ -514,8 +510,6 @@ static void xennet_tx_setup_grant(unsigned long gfn, unsigned int offset,
 		memcpy(pfn_to_kaddr(page_to_pfn(queue->grant_tx_page[id])),
 				pfn_to_kaddr(page_to_pfn(page)) + offset, len);
 		offset = 0; // worried that offsets will introduce bleeding
-		printk("[queue %d] xennet_tx_setup_grant(): memcpy'd client buf into page\n",
-					queue->id);
 	} else {
 		queue->grant_tx_page[id] = page;
 	}
@@ -1553,7 +1547,7 @@ static bool xennet_handle_tx(struct netfront_queue *queue, unsigned int *eoi)
 
 static irqreturn_t xennet_tx_interrupt(int irq, void *dev_id)
 {
-	unsigned int eoiflag = XEN_EOI_FLAG_SPURIOUS;
+	unsigned int eoiflag = 0;
 
 	if (likely(xennet_handle_tx(dev_id, &eoiflag)))
 		xen_irq_lateeoi(irq, eoiflag);
@@ -1593,7 +1587,7 @@ static bool xennet_handle_rx(struct netfront_queue *queue, unsigned int *eoi)
 
 static irqreturn_t xennet_rx_interrupt(int irq, void *dev_id)
 {
-	unsigned int eoiflag = XEN_EOI_FLAG_SPURIOUS;
+	unsigned int eoiflag = 0;
 
 	if (likely(xennet_handle_rx(dev_id, &eoiflag)))
 		xen_irq_lateeoi(irq, eoiflag);
@@ -1603,7 +1597,7 @@ static irqreturn_t xennet_rx_interrupt(int irq, void *dev_id)
 
 static irqreturn_t xennet_interrupt(int irq, void *dev_id)
 {
-	unsigned int eoiflag = XEN_EOI_FLAG_SPURIOUS;
+	unsigned int eoiflag = 0;
 
 	if (xennet_handle_tx(dev_id, &eoiflag) &&
 	    xennet_handle_rx(dev_id, &eoiflag))
@@ -2071,7 +2065,6 @@ static int xennet_init_queue(struct netfront_queue *queue)
 		queue->grant_tx_page[i] = queue->info->persistent_grants ?
 										alloc_page(GFP_NOIO) : NULL;
 	}
-	printk("[queue %d] xennet_init_queue(): refs and pool pages initialized\n", queue->id);
 	queue->tx_link[NET_TX_RING_SIZE - 1] = TX_LINK_NONE;
 
 	/* Clear out rx_skbs */

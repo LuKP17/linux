@@ -185,7 +185,6 @@ static struct page *get_free_page(struct xenvif_queue *queue,
 	struct page *page;
 
 	if (!persistent || gnttab_page_cache_get(&queue->persistent_pages, &page)) {
-		WARN_ON(persistent); // shouldn't map with mmap page (without errors)
 		page = queue->mmap_pages[pending_idx];
 	}
 
@@ -197,8 +196,6 @@ static int add_persistent_gnt(struct xenvif_queue *queue,
 {
 	struct rb_node **new = NULL, *parent = NULL;
 	struct persistent_gnt *this;
-
-	WARN_ON(!pgrant);
 
 	if (queue->persistent_gnt_c >= xenvif_max_pgrants) {
 		pr_alert_ratelimited("trying to add a gref when pgrant limit has been reached\n");
@@ -220,14 +217,12 @@ static int add_persistent_gnt(struct xenvif_queue *queue,
 		}
 	}
 	pgrant->active = true;
-	printk("[queue %u] add_persistent_gnt(): gref %u added to the tree\n", queue->id, pgrant->gnt);
 	
 	/* Add new node and rebalance tree. */
 	rb_link_node(&(pgrant->node), parent, new);
 	rb_insert_color(&(pgrant->node), &queue->persistent_gnts);
 	queue->persistent_gnt_c++;
 	//idk what it's for... atomic_inc(&queue->persistent_gnt_in_use);
-	printk("[queue %u] add_persistent_gnt(): now %d pgrants in the tree\n", queue->id, queue->persistent_gnt_c);
 	
 	return 0;
 }
@@ -247,7 +242,6 @@ static struct persistent_gnt *get_persistent_gnt(struct xenvif_queue *queue,
 		else if (gref > pgrant->gnt)
 			node = node->rb_right;
 		else {
-			printk("[queue %u] get_persistent_gnt(): getting gref %u from the tree\n", queue->id, pgrant->gnt);
 			if (pgrant->active) {
 				pr_alert_ratelimited("requesting a grant already in use\n");
 				return ERR_PTR(-EBUSY);
@@ -257,21 +251,18 @@ static struct persistent_gnt *get_persistent_gnt(struct xenvif_queue *queue,
 			return pgrant;
 		}
 	}
-	printk("[queue %u] get_persistent_gnt(): gref %u isn't in the tree\n", queue->id, gref);
+
 	return NULL;
 }
 
 static void put_persistent_gnt(struct xenvif_queue *queue,
                             struct persistent_gnt *pgrant)
 {
-	WARN_ON(!pgrant);
-
 	if (!pgrant->active)
 		pr_alert_ratelimited("freeing a grant already unused\n");
 
 	pgrant->active = false;
 	//idk what it's for... atomic_dec(&ring->persistent_gnt_in_use);
-	printk("[queue %u] put_persistent_gnt(): put pgrant with gref %u\n", queue->id, pgrant->gnt);
 }
 
 static void free_persistent_gnts(struct xenvif_queue *queue,
@@ -314,15 +305,12 @@ static void free_persistent_gnts(struct xenvif_queue *queue,
 		num--;
 	}
 	BUG_ON(num != 0);
-	printk("[queue %u] free_persistent_gnts(): freed all pgrants from the tree\n", queue->id);
 }
 
 static inline void xenvif_pgrant_set(struct xenvif_queue *queue,
 									u16 pending_idx,
 									struct persistent_gnt *pgrant)
 {
-	WARN_ON(!pgrant);
-
 	if (unlikely(queue->tx_pgrants[pending_idx])) {
 		netdev_err(queue->vif->dev,
 			"Trying to overwrite an active persistent grant! pending_idx: 0x%x\n",
@@ -330,11 +318,6 @@ static inline void xenvif_pgrant_set(struct xenvif_queue *queue,
 		BUG();
 	}
 	queue->tx_pgrants[pending_idx] = pgrant;
-	
-	WARN_ON(!pgrant->active); // don't set a pgrant marked inactive
-
-	printk("[queue %u] xenvif_pgrant_set(): set pgrant with gref %u at index %u\n",
-				queue->id, pgrant->gnt, pending_idx);
 }
 
 static inline void xenvif_pgrant_reset(struct xenvif_queue *queue,
@@ -350,9 +333,6 @@ static inline void xenvif_pgrant_reset(struct xenvif_queue *queue,
 	}
 	put_persistent_gnt(queue, pgrant);
 	queue->tx_pgrants[pending_idx] = NULL;
-
-	printk("[queue %u] xenvif_pgrant_reset(): reset pgrant at index %u\n",
-				queue->id, pending_idx);
 }
 
 /*
@@ -362,8 +342,6 @@ static struct persistent_gnt *xenvif_pgrant_new(struct xenvif_queue *queue,
 												struct gnttab_map_grant_ref *gop)
 {
 	struct persistent_gnt *pgrant;
-
-	WARN_ON(!gop);
 
 	pgrant = kmalloc(sizeof(struct persistent_gnt), GFP_KERNEL);
 	if (!pgrant)
@@ -380,9 +358,6 @@ static struct persistent_gnt *xenvif_pgrant_new(struct xenvif_queue *queue,
 		//return NULL;
 	}
 
-	printk("[queue %u] xenvif_pgrant_new(): new pgrant with gref %u, handle %u\n",
-				queue->id, pgrant->gnt, pgrant->handle);
-
 	return pgrant;
 }
 
@@ -391,8 +366,6 @@ static struct persistent_gnt *xenvif_pgrant_new(struct xenvif_queue *queue,
  */
 void xenvif_pgrants_destroy(struct xenvif_queue *queue)
 {
-	int i;
-
 	if (!RB_EMPTY_ROOT(&queue->persistent_gnts))
 		free_persistent_gnts(queue, &queue->persistent_gnts,
 			queue->persistent_gnt_c);
@@ -402,12 +375,6 @@ void xenvif_pgrants_destroy(struct xenvif_queue *queue)
 	queue->persistent_gnt_c = 0;
 
 	gnttab_page_cache_shrink(&queue->persistent_pages, 0 /* All */);
-
-	// L17 TEST remove when tests are done
-	for (i = 0; i < MAX_PENDING_REQS; i++) {
-		if (queue->tx_pgrants[i] != NULL)
-			printk("[queue %u] xenvif_pgrants_destroy(): tx_pgrants still contains grants when freeing!\n", queue->id);
-	}
 }
 
 void xenvif_kick_thread(struct xenvif_queue *queue)
@@ -594,14 +561,10 @@ static inline void xenvif_tx_create_map_op(struct xenvif_queue *queue,
 					   struct page *page,
 					   struct gnttab_map_grant_ref *mop)
 {
-	WARN_ON(!page);
 	queue->pages_to_map[mop-queue->tx_map_ops] = page;
 	gnttab_set_map_op(mop, page_to_kaddr(page),
 			  GNTMAP_host_map | GNTMAP_readonly,
 			  txp->gref, queue->vif->domid);
-
-	printk("[queue %u] xenvif_tx_create_map_op(): created map op with gref %u\n",
-				queue->id, mop->ref);
 }
 
 static inline struct sk_buff *xenvif_alloc_skb(unsigned int size)
@@ -691,8 +654,6 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 
 		if (amount == txp->size) {
 			/* The copy op covered the full tx_request */
-			printk("[queue %u] xenvif_get_requests(): request with gref %u covered with copies\n",
-						queue->id, txp->gref);
 			memcpy(&queue->pending_tx_info[pending_idx].req,
 			       txp, sizeof(*txp));
 			queue->pending_tx_info[pending_idx].extra_count =
@@ -710,14 +671,10 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 			 * The remainder will be mapped or copied in the next
 			 * iteration.
 			 */
-			printk("[queue %u] xenvif_get_requests(): request with gref %u partially covered with copies\n",
-						queue->id, txp->gref);
 			txp->offset += amount;
 			txp->size -= amount;
 		}
 	}
-
-	printk("[queue %u] xenvif_get_requests(): finished creating copies! %d slots remaining\n", queue->id, nr_slots);
 
 	/* Create map ops for the skb frags */
 	for (shinfo->nr_frags = 0; nr_slots > 0 && shinfo->nr_frags < MAX_SKB_FRAGS;
@@ -742,8 +699,6 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 			xenvif_pgrant_set(queue, pending_idx, pgrant);
 		}
 
-		printk("[queue %u] xenvif_get_requests(): request with gref %u covered with mapping\n",
-						queue->id, txp->gref);
 		memcpy(&queue->pending_tx_info[pending_idx].req, txp, sizeof(*txp));
 		queue->pending_tx_info[pending_idx].extra_count =
 				(txp == first) ? extra_count : 0;
@@ -808,8 +763,6 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 
 	(*copy_ops) = cop - queue->tx_copy_ops;
 	(*map_ops) = gop - queue->tx_map_ops;
-
-	printk("[queue %u] xenvif_get_requests(): finished creating maps!\n", queue->id);
 }
 
 static inline void xenvif_grant_handle_set(struct xenvif_queue *queue,
@@ -824,8 +777,6 @@ static inline void xenvif_grant_handle_set(struct xenvif_queue *queue,
 		BUG();
 	}
 	queue->grant_tx_handle[pending_idx] = handle;
-	printk("[queue %u] xenvif_grant_handle_set(): set grant handle %u at index %u\n",
-				queue->id, handle, pending_idx);
 }
 
 static inline void xenvif_grant_handle_reset(struct xenvif_queue *queue,
@@ -839,8 +790,6 @@ static inline void xenvif_grant_handle_reset(struct xenvif_queue *queue,
 		BUG();
 	}
 	queue->grant_tx_handle[pending_idx] = NETBACK_INVALID_HANDLE;
-	printk("[queue %u] xenvif_grant_handle_reset(): reset grant handle at index %u\n",
-				queue->id, pending_idx);
 }
 
 static int xenvif_tx_check_gop(struct xenvif_queue *queue,
@@ -879,7 +828,6 @@ static int xenvif_tx_check_gop(struct xenvif_queue *queue,
 				newerr = (*gopp_copy)->status;
 		}
 		if (likely(!newerr)) {
-			printk("[queue %u] xenvif_tx_check_gop(): header copy at pending_idx %u was successful\n", queue->id, pending_idx);
 			/* The first frag might still have this slot mapped */
 			if (i < copy_count(skb) - 1 || !sharedslot)
 				xenvif_idx_release(queue, pending_idx,
@@ -908,7 +856,6 @@ check_frags:
 		// if there is a pgrant at pending_idx, set grant handle and continue
 		pgrant = queue->tx_pgrants[pending_idx];
 		if (pgrant) {
-			printk("[queue %u] xenvif_tx_check_gop(): pgrant with gref %u found for frag at pending_idx %u\n", queue->id, pgrant->gnt, pending_idx);
 			xenvif_grant_handle_set(queue,
 						pending_idx,
 						pgrant->handle);
@@ -921,7 +868,6 @@ check_frags:
 		newerr = gop_map->status;
 
 		if (likely(!newerr)) {
-			printk("[queue %u] xenvif_tx_check_gop(): frag map at pending_index %u with gref %u was successful\n", queue->id, pending_idx, gop_map->ref);
 			xenvif_grant_handle_set(queue,
 						pending_idx,
 						gop_map->handle);
@@ -1015,7 +961,6 @@ static void xenvif_fill_frags(struct xenvif_queue *queue, struct sk_buff *skb)
 		u16 pending_idx;
 
 		pending_idx = frag_get_pending_idx(frag);
-		printk("[queue %u] xenvif_fill_frags(): frag pending_idx: %u\n", queue->id, pending_idx);
 
 		/* If this is not the first frag, chain it to the previous*/
 		if (prev_pending_idx == INVALID_PENDING_IDX)
@@ -1029,13 +974,8 @@ static void xenvif_fill_frags(struct xenvif_queue *queue, struct sk_buff *skb)
 		prev_pending_idx = pending_idx;
 
 		txp = &queue->pending_tx_info[pending_idx].req;
-		printk("[queue %u] xenvif_fill_frags(): associated request: gref %u, offset %u, size %u\n", queue->id, txp->gref, txp->offset, txp->size);
 		// if there is a pgrant at pending_idx, get the page from the pgrant
 		pgrant = queue->tx_pgrants[pending_idx];
-		if (pgrant)
-			printk("[queue %u] xenvif_fill_frags(): associated pgrant: gref %u, handle %u\n", queue->id, pgrant->gnt, pgrant->handle);
-		else
-			printk("[queue %u] xenvif_fill_frags(): associated pgrant: NONE\n", queue->id);
 		page = pgrant ? pgrant->page : queue->mmap_pages[pending_idx];
 		__skb_fill_page_desc(skb, i, page, txp->offset, txp->size);
 		skb->len += txp->size;
@@ -1273,8 +1213,6 @@ static void xenvif_tx_build_gops(struct xenvif_queue *queue,
 		if (!work_to_do)
 			break;
 
-		printk("[queue %u] ///////////////////////// SKB START\n", queue->id);
-
 		idx = queue->tx.req_cons;
 		rmb(); /* Ensure that we see the request before we copy it. */
 		RING_COPY_REQUEST(&queue->tx, idx, &txreq);
@@ -1384,7 +1322,6 @@ static void xenvif_tx_build_gops(struct xenvif_queue *queue,
 						   "Can't allocate the frag_list skb.\n");
 				break;
 			}
-			printk("WE HAVE A FRAG_LIST SKB\n");
 		}
 
 		if (extras[XEN_NETIF_EXTRA_TYPE_GSO - 1].type) {
@@ -1426,12 +1363,6 @@ static void xenvif_tx_build_gops(struct xenvif_queue *queue,
 					     *(u32 *)extra->u.hash.value,
 					     type);
 		}
-
-		printk("[queue %u] xenvif_tx_build_gops(): skb uses %d slots, %u bytes to copy\n",
-					queue->id, skb_shinfo(skb)->nr_frags + frag_overflow + 1, data_len);
-		printk("[queue %u] xenvif_tx_build_gops(): gref of all requests: %u", queue->id, txreq.gref);
-		for (int i = 0; i < ret; i++)
-			printk(", %u", txfrags[i].gref);
 
 		xenvif_get_requests(queue, skb, &txreq, txfrags, copy_ops,
 				    map_ops, frag_overflow, nskb, extra_count,
@@ -1620,8 +1551,6 @@ static int xenvif_tx_submit(struct xenvif_queue *queue)
 		}
 
 		netif_receive_skb(skb);
-
-		printk("[queue %u] ///////////////////////// SKB SENT\n", queue->id);
 	}
 
 	return work_done;
