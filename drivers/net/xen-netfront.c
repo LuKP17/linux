@@ -659,8 +659,6 @@ static int xennet_xdp_xmit_one(struct net_device *dev,
 	tx_stats->packets++;
 	u64_stats_update_end(&tx_stats->syncp);
 
-	xennet_tx_buf_gc(queue);
-
 	return 0;
 }
 
@@ -869,9 +867,6 @@ static netdev_tx_t xennet_start_xmit(struct sk_buff *skb, struct net_device *dev
 	tx_stats->bytes += skb->len;
 	tx_stats->packets++;
 	u64_stats_update_end(&tx_stats->syncp);
-
-	/* Note: It is not safe to access skb after xennet_tx_buf_gc()! */
-	xennet_tx_buf_gc(queue);
 
 	if (!netfront_tx_slot_available(queue))
 		netif_tx_stop_queue(netdev_get_tx_queue(dev, queue->id));
@@ -1547,7 +1542,7 @@ static bool xennet_handle_tx(struct netfront_queue *queue, unsigned int *eoi)
 
 static irqreturn_t xennet_tx_interrupt(int irq, void *dev_id)
 {
-	unsigned int eoiflag = 0;
+	unsigned int eoiflag = XEN_EOI_FLAG_SPURIOUS;
 
 	if (likely(xennet_handle_tx(dev_id, &eoiflag)))
 		xen_irq_lateeoi(irq, eoiflag);
@@ -1587,7 +1582,7 @@ static bool xennet_handle_rx(struct netfront_queue *queue, unsigned int *eoi)
 
 static irqreturn_t xennet_rx_interrupt(int irq, void *dev_id)
 {
-	unsigned int eoiflag = 0;
+	unsigned int eoiflag = XEN_EOI_FLAG_SPURIOUS;
 
 	if (likely(xennet_handle_rx(dev_id, &eoiflag)))
 		xen_irq_lateeoi(irq, eoiflag);
@@ -1597,7 +1592,7 @@ static irqreturn_t xennet_rx_interrupt(int irq, void *dev_id)
 
 static irqreturn_t xennet_interrupt(int irq, void *dev_id)
 {
-	unsigned int eoiflag = 0;
+	unsigned int eoiflag = XEN_EOI_FLAG_SPURIOUS;
 
 	if (xennet_handle_tx(dev_id, &eoiflag) &&
 	    xennet_handle_rx(dev_id, &eoiflag))
