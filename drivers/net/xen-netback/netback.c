@@ -73,7 +73,7 @@ module_param_named(max_queues, xenvif_max_queues, uint, 0644);
 MODULE_PARM_DESC(max_queues,
 		 "Maximum number of queues per virtual interface");
 
-// L17 TODO: test performance with higher values like blkback's hardcoded 1056
+// L17 TODO: test performance with higher values like blkback's hardcoded 1056. For this, advertise this var via xenstore for the frontend and frontend is still tied to 256
 /*
  * Maximum number of grants to map persistently in netback.
  */
@@ -184,9 +184,8 @@ static struct page *get_free_page(struct xenvif_queue *queue,
 {
 	struct page *page;
 
-	if (!persistent || gnttab_page_cache_get(&queue->persistent_pages, &page)) {
+	if (!persistent || gnttab_page_cache_get(&queue->persistent_pages, &page))
 		page = queue->mmap_pages[pending_idx];
-	}
 
 	return page;
 }
@@ -198,6 +197,7 @@ static int add_persistent_gnt(struct xenvif_queue *queue,
 	struct persistent_gnt *this;
 
 	if (queue->persistent_gnt_c >= xenvif_max_pgrants) {
+		printk("[queue %u] PGRANTS LIMIT REACHED\n", queue->id);
 		pr_alert_ratelimited("trying to add a gref when pgrant limit has been reached\n");
 		return -EBUSY;
 	}
@@ -223,6 +223,7 @@ static int add_persistent_gnt(struct xenvif_queue *queue,
 	rb_insert_color(&(pgrant->node), &queue->persistent_gnts);
 	queue->persistent_gnt_c++;
 	//idk what it's for... atomic_inc(&queue->persistent_gnt_in_use);
+	printk("[queue %u] now %u pgrants in the tree\n", queue->id, queue->persistent_gnt_c);
 	
 	return 0;
 }
