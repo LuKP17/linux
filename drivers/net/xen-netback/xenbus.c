@@ -972,6 +972,9 @@ static int read_xenbus_vif_flags(struct backend_info *be)
 	vif->ipv6_csum = !!xenbus_read_unsigned(dev->otherend,
 						"feature-ipv6-csum-offload", 0);
 
+	vif->persistent_grants = xenvif_max_pgrants &&
+		xenbus_read_unsigned(dev->otherend, "feature-persistent", 0);
+
 	read_xenbus_frontend_xdp(be, dev);
 
 	return 0;
@@ -1115,6 +1118,12 @@ static int netback_probe(struct xenbus_device *dev,
 			    "%u", separate_tx_rx_irq);
 	if (err)
 		pr_debug("Error writing feature-split-event-channels\n");
+
+	/* Persistent grants support, this is an optional feature */
+	err = xenbus_printf(XBT_NIL, dev->nodename,
+				"feature-persistent", "%d", xenvif_max_pgrants > 0);
+	if (err)
+		pr_debug("Error writing feature-persistent\n");
 
 	/* Multi-queue support: This is an optional feature. */
 	err = xenbus_printf(XBT_NIL, dev->nodename,
