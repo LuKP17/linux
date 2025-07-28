@@ -1238,6 +1238,8 @@ static void xenvif_tx_build_gops(struct xenvif_queue *queue,
 	int ret;
 	unsigned int frag_overflow;
 
+	printk("[domid %u, queue %u] xenvif_tx_build_gops(): %u skbs in queue before reading requests\n", queue->vif->domid, queue->id, skb_queue_len(&queue->tx_queue));
+
 	while (skb_queue_len(&queue->tx_queue) < budget) {
 		struct xen_netif_tx_request txreq;
 		struct xen_netif_tx_request txfrags[XEN_NETBK_LEGACY_SLOTS_MAX];
@@ -1435,6 +1437,8 @@ static void xenvif_tx_build_gops(struct xenvif_queue *queue,
 		    (*copy_ops >= ARRAY_SIZE(queue->tx_copy_ops)))
 			break;
 	}
+
+	printk("[domid %u, queue %u] xenvif_tx_build_gops(): %u skbs in queue after reading requests\n", queue->vif->domid,  queue->id, skb_queue_len(&queue->tx_queue));
 
 	return;
 }
@@ -1736,6 +1740,8 @@ int xenvif_tx_action(struct xenvif_queue *queue, int budget)
 
 	if (unlikely(!tx_work_todo(queue)))
 		return 0;
+
+	printk("[domid %u, queue %u] xenvif_tx_action(): netfront called with budget %d\n", queue->vif->domid, queue->id, budget);
 
 	xenvif_tx_build_gops(queue, budget, &nr_cops, &nr_mops);
 
