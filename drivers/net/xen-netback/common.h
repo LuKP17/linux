@@ -224,6 +224,7 @@ struct xenvif_queue { /* Per-queue data for xenvif */
 	/* Persistent grants */
 	struct rb_root	persistent_gnts;
 	unsigned int	persistent_gnt_c;
+	atomic_t	persistent_gnt_in_use;
 	struct gnttab_page_cache persistent_pages;
 	struct persistent_gnt *tx_pgrants[MAX_PENDING_REQS];
 

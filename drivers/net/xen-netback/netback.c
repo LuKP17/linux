@@ -226,7 +226,7 @@ static int add_persistent_gnt(struct xenvif_queue *queue,
 	rb_link_node(&(pgrant->node), parent, new);
 	rb_insert_color(&(pgrant->node), &queue->persistent_gnts);
 	queue->persistent_gnt_c++;
-	//idk what it's for... atomic_inc(&queue->persistent_gnt_in_use);
+	atomic_inc(&queue->persistent_gnt_in_use);
 	printk("[domid %u, queue %u] add_persistent_gnt(): now %d pgrants in the tree\n", queue->vif->domid, queue->id, queue->persistent_gnt_c);
 	
 	return 0;
@@ -253,7 +253,7 @@ static struct persistent_gnt *get_persistent_gnt(struct xenvif_queue *queue,
 				return ERR_PTR(-EBUSY);
 			}
 			pgrant->active = true;
-			//idk what it's for... atomic_inc(&queue->persistent_gnt_in_use);
+			atomic_inc(&queue->persistent_gnt_in_use);
 			return pgrant;
 		}
 	}
@@ -270,7 +270,7 @@ static void put_persistent_gnt(struct xenvif_queue *queue,
 		pr_alert_ratelimited("freeing a grant already unused\n");
 
 	pgrant->active = false;
-	//idk what it's for... atomic_dec(&ring->persistent_gnt_in_use);
+	atomic_dec(&queue->persistent_gnt_in_use);
 	printk("[domid %u, queue %u] put_persistent_gnt(): put pgrant with gref %u\n", queue->vif->domid, queue->id, pgrant->gnt);
 }
 
@@ -987,6 +987,8 @@ check_frags:
 		goto check_frags;
 	}
 
+	printk("[queue %u, domid %u] xenvif_tx_check_gop(): %d pgrants in use after checking Xen ops\n", queue->id, queue->vif->domid, queue->persistent_gnt_in_use);
+
 	*gopp_map = gop_map;
 	return err;
 }
@@ -1438,7 +1440,7 @@ static void xenvif_tx_build_gops(struct xenvif_queue *queue,
 			break;
 	}
 
-	printk("[domid %u, queue %u] xenvif_tx_build_gops(): %u skbs in queue after reading requests\n", queue->vif->domid,  queue->id, skb_queue_len(&queue->tx_queue));
+	printk("[domid %u, queue %u] xenvif_tx_build_gops(): %d pgrants in use / %u skbs in queue after reading requests\n", queue->vif->domid, queue->id, queue->persistent_gnt_in_use, skb_queue_len(&queue->tx_queue));
 
 	return;
 }
