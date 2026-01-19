@@ -97,6 +97,12 @@ unsigned int xenvif_hash_cache_size = XENVIF_HASH_CACHE_SIZE_DEFAULT;
 module_param_named(hash_cache_size, xenvif_hash_cache_size, uint, 0644);
 MODULE_PARM_DESC(hash_cache_size, "Number of flows in the hash cache");
 
+/* This is the maximum number of grefs in the mapping table. */
+#define XENVIF_GREF_MAPPING_SIZE_DEFAULT 768
+unsigned int xenvif_gref_mapping_size = XENVIF_GREF_MAPPING_SIZE_DEFAULT;
+module_param_named(gref_mapping_size, xenvif_gref_mapping_size, uint, 0644);
+MODULE_PARM_DESC(gref_mapping_size, "Number of grefs in the mapping table");
+
 /* The module parameter tells that we have to put data
  * for xen-netfront with the XDP_PACKET_HEADROOM offset
  * needed for XDP processing
@@ -228,6 +234,71 @@ static void xenvif_fatal_tx_err(struct xenvif *vif)
 		xenvif_kick_thread(&vif->queues[0]);
 }
 
+static inline void xenvif_grant_handle_set(struct xenvif_queue *queue,
+					   u16 pending_idx,
+					   grant_handle_t handle)
+{
+	if (unlikely(queue->grant_tx_handle[pending_idx] !=
+		     NETBACK_INVALID_HANDLE)) {
+		netdev_err(queue->vif->dev,
+			   "Trying to overwrite active handle! pending_idx: 0x%x\n",
+			   pending_idx);
+		BUG();
+	}
+	queue->grant_tx_handle[pending_idx] = handle;
+}
+
+static inline void xenvif_grant_handle_reset(struct xenvif_queue *queue,
+					     u16 pending_idx)
+{
+	if (unlikely(queue->grant_tx_handle[pending_idx] ==
+		     NETBACK_INVALID_HANDLE)) {
+		netdev_err(queue->vif->dev,
+			   "Trying to unmap invalid handle! pending_idx: 0x%x\n",
+			   pending_idx);
+		BUG();
+	}
+	queue->grant_tx_handle[pending_idx] = NETBACK_INVALID_HANDLE;
+}
+
+static void xenvif_tx_grant_reset(struct xenvif_queue *queue, u16 pending_idx)
+{
+	struct xenvif_grant *grant = queue->tx_grants[pending_idx];
+
+	xenvif_put_grant(queue, grant);
+	xenvif_grant_handle_reset(queue, pending_idx);
+	queue->tx_grants[pending_idx] = NULL;
+}
+
+static void xenvif_tx_grant_release(struct xenvif_queue *queue, u16 pending_idx)
+{
+	if (queue->tx_grants[pending_idx])
+		xenvif_tx_grant_reset(queue, pending_idx);
+	else
+		xenvif_idx_unmap(queue, pending_idx);
+	xenvif_idx_release(queue, pending_idx, XEN_NETIF_RSP_OKAY);
+}
+
+/* Checks if there's a grant available for gref and if so, set it also
+ * in the tx_grants array that keeps the ones in flight.
+ */
+static bool xenvif_tx_grant(struct xenvif_queue *queue, grant_ref_t ref,
+			    u16 pending_idx)
+{
+	struct xenvif_grant *grant = xenvif_get_grant(queue, ref);
+	grant_handle_t handle = !grant ? NETBACK_INVALID_HANDLE : grant->handle;
+
+	if (unlikely(queue->tx_grants[pending_idx])) {
+		netdev_err(queue->vif->dev,
+			   "Trying to overwrite an active grant! pending_idx: %x\n",
+			   pending_idx);
+		BUG();
+	}
+	xenvif_grant_handle_set(queue, pending_idx, handle);
+	queue->tx_grants[pending_idx] = grant;
+	return !!grant;
+}
+
 static int xenvif_count_requests(struct xenvif_queue *queue,
 				 struct xen_netif_tx_request *first,
 				 unsigned int extra_count,
@@ -339,15 +410,20 @@ struct xenvif_tx_cb {
 
 static inline void xenvif_tx_create_map_op(struct xenvif_queue *queue,
 					   u16 pending_idx,
-					   struct xen_netif_tx_request *txp,
-					   unsigned int extra_count,
+					   grant_ref_t gref,
 					   struct gnttab_map_grant_ref *mop)
 {
 	queue->pages_to_map[mop-queue->tx_map_ops] = queue->mmap_pages[pending_idx];
 	gnttab_set_map_op(mop, idx_to_kaddr(queue, pending_idx),
 			  GNTMAP_host_map | GNTMAP_readonly,
-			  txp->gref, queue->vif->domid);
+			  gref, queue->vif->domid);
+}
 
+static inline void xenvif_tx_copy_request(struct xenvif_queue *queue,
+					   u16 pending_idx,
+					   struct xen_netif_tx_request *txp,
+					   unsigned int extra_count)
+{
 	memcpy(&queue->pending_tx_info[pending_idx].req, txp,
 	       sizeof(*txp));
 	queue->pending_tx_info[pending_idx].extra_count = extra_count;
@@ -468,11 +544,12 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 
 		index = pending_index(queue->pending_cons++);
 		pending_idx = queue->pending_ring[index];
-		xenvif_tx_create_map_op(queue, pending_idx, txp,
-				        txp == first ? extra_count : 0, gop);
+		if (!xenvif_tx_grant(queue, txp->gref, pending_idx))
+			xenvif_tx_create_map_op(queue, pending_idx, txp->gref, gop++);
+		xenvif_tx_copy_request(queue, pending_idx, txp,
+						txp == first ? extra_count : 0);
 		frag_set_pending_idx(&frags[shinfo->nr_frags], pending_idx);
 		++shinfo->nr_frags;
-		++gop;
 
 		if (txp == first)
 			txp = txfrags;
@@ -494,12 +571,12 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 
 			index = pending_index(queue->pending_cons++);
 			pending_idx = queue->pending_ring[index];
-			xenvif_tx_create_map_op(queue, pending_idx, txp, 0,
-						gop);
+			if (!xenvif_tx_grant(queue, txp->gref, pending_idx))
+				xenvif_tx_create_map_op(queue, pending_idx, txp->gref, gop++);
+			xenvif_tx_copy_request(queue, pending_idx, txp, 0);
 			frag_set_pending_idx(&frags[shinfo->nr_frags],
 					     pending_idx);
 			++shinfo->nr_frags;
-			++gop;
 		}
 
 		if (shinfo->nr_frags) {
@@ -518,33 +595,6 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 
 	(*copy_ops) = cop - queue->tx_copy_ops;
 	(*map_ops) = gop - queue->tx_map_ops;
-}
-
-static inline void xenvif_grant_handle_set(struct xenvif_queue *queue,
-					   u16 pending_idx,
-					   grant_handle_t handle)
-{
-	if (unlikely(queue->grant_tx_handle[pending_idx] !=
-		     NETBACK_INVALID_HANDLE)) {
-		netdev_err(queue->vif->dev,
-			   "Trying to overwrite active handle! pending_idx: 0x%x\n",
-			   pending_idx);
-		BUG();
-	}
-	queue->grant_tx_handle[pending_idx] = handle;
-}
-
-static inline void xenvif_grant_handle_reset(struct xenvif_queue *queue,
-					     u16 pending_idx)
-{
-	if (unlikely(queue->grant_tx_handle[pending_idx] ==
-		     NETBACK_INVALID_HANDLE)) {
-		netdev_err(queue->vif->dev,
-			   "Trying to unmap invalid handle! pending_idx: 0x%x\n",
-			   pending_idx);
-		BUG();
-	}
-	queue->grant_tx_handle[pending_idx] = NETBACK_INVALID_HANDLE;
 }
 
 static int xenvif_tx_check_gop(struct xenvif_queue *queue,
@@ -604,10 +654,14 @@ static int xenvif_tx_check_gop(struct xenvif_queue *queue,
 	}
 
 check_frags:
-	for (i = 0; i < nr_frags; i++, gop_map++) {
+	for (i = 0; i < nr_frags; i++) {
 		int j, newerr;
 
 		pending_idx = frag_get_pending_idx(&shinfo->frags[i]);
+
+		/* Skip the fragment if it's already in the mapping table */
+		if (!err && queue->tx_grants[pending_idx])
+			continue;
 
 		/* Check error status: if okay then remember grant handle. */
 		newerr = gop_map->status;
@@ -630,6 +684,7 @@ check_frags:
 					xenvif_idx_release(queue, pending_idx,
 							   XEN_NETIF_RSP_OKAY);
 			}
+			gop_map++;
 			continue;
 		}
 
@@ -651,9 +706,7 @@ check_frags:
 		/* Invalidate preceding fragments of this skb. */
 		for (j = 0; j < i; j++) {
 			pending_idx = frag_get_pending_idx(&shinfo->frags[j]);
-			xenvif_idx_unmap(queue, pending_idx);
-			xenvif_idx_release(queue, pending_idx,
-					   XEN_NETIF_RSP_OKAY);
+			xenvif_tx_grant_release(queue, pending_idx);
 		}
 
 		/* And if we found the error while checking the frag_list, unmap
@@ -662,14 +715,13 @@ check_frags:
 		if (first_shinfo) {
 			for (j = 0; j < first_shinfo->nr_frags; j++) {
 				pending_idx = frag_get_pending_idx(&first_shinfo->frags[j]);
-				xenvif_idx_unmap(queue, pending_idx);
-				xenvif_idx_release(queue, pending_idx,
-						   XEN_NETIF_RSP_OKAY);
+				xenvif_tx_grant_release(queue, pending_idx);
 			}
 		}
 
 		/* Remember the error: invalidate all subsequent fragments. */
 		err = newerr;
+		gop_map++;
 	}
 
 	if (skb_has_frag_list(skb) && !first_shinfo) {
@@ -694,6 +746,7 @@ static void xenvif_fill_frags(struct xenvif_queue *queue, struct sk_buff *skb)
 	for (i = 0; i < nr_frags; i++) {
 		skb_frag_t *frag = shinfo->frags + i;
 		struct xen_netif_tx_request *txp;
+		struct xenvif_grant *grant;
 		struct page *page;
 		u16 pending_idx;
 
@@ -711,14 +764,16 @@ static void xenvif_fill_frags(struct xenvif_queue *queue, struct sk_buff *skb)
 		prev_pending_idx = pending_idx;
 
 		txp = &queue->pending_tx_info[pending_idx].req;
-		page = virt_to_page((void *)idx_to_kaddr(queue, pending_idx));
+		grant = queue->tx_grants[pending_idx];
+		page = (grant ? grant->page :
+			virt_to_page((void *)idx_to_kaddr(queue, pending_idx)));
 		__skb_fill_page_desc(skb, i, page, txp->offset, txp->size);
 		skb->len += txp->size;
 		skb->data_len += txp->size;
 		skb->truesize += txp->size;
 
 		/* Take an extra reference to offset network stack's put_page */
-		get_page(queue->mmap_pages[pending_idx]);
+		get_page(page);
 	}
 }
 
@@ -1284,7 +1339,7 @@ static void xenvif_zerocopy_callback(struct sk_buff *skb,
 				     bool zerocopy_success)
 {
 	unsigned long flags;
-	pending_ring_idx_t index;
+	pending_ring_idx_t index, dealloc_prod_save;
 	struct ubuf_info_msgzc *ubuf = uarg_to_msgzc(ubuf_base);
 	struct xenvif_queue *queue = ubuf_to_queue(ubuf);
 
@@ -1292,9 +1347,14 @@ static void xenvif_zerocopy_callback(struct sk_buff *skb,
 	 * from each other.
 	 */
 	spin_lock_irqsave(&queue->callback_lock, flags);
+	dealloc_prod_save = queue->dealloc_prod;
 	do {
 		u16 pending_idx = ubuf->desc;
 		ubuf = (struct ubuf_info_msgzc *) ubuf->ctx;
+		if (queue->tx_grants[pending_idx]) {
+			xenvif_tx_grant_release(queue, pending_idx);
+			continue;
+		}
 		BUG_ON(queue->dealloc_prod - queue->dealloc_cons >=
 			MAX_PENDING_REQS);
 		index = pending_index(queue->dealloc_prod);
@@ -1311,7 +1371,7 @@ static void xenvif_zerocopy_callback(struct sk_buff *skb,
 		queue->stats.tx_zerocopy_success++;
 	else
 		queue->stats.tx_zerocopy_fail++;
-	xenvif_skb_zerocopy_complete(queue);
+	xenvif_skb_zerocopy_complete(queue, dealloc_prod_save);
 }
 
 const struct ubuf_info_ops xenvif_ubuf_ops = {
@@ -1678,6 +1738,25 @@ static void process_ctrl_request(struct xenvif *vif,
 		status = xenvif_set_hash_mapping(vif, req->data[0],
 						 req->data[1],
 						 req->data[2]);
+		break;
+	
+	case XEN_NETIF_CTRL_TYPE_GET_GREF_MAPPING_SIZE:
+		status = xenvif_get_gref_mapping_size(vif, req->data[0],
+						      &data);
+		break;
+
+	case XEN_NETIF_CTRL_TYPE_ADD_GREF_MAPPING:
+		status = xenvif_add_gref_mapping(vif, req->data[0],
+						 req->data[1],
+						 req->data[2],
+						 &data);
+		break;
+
+	case XEN_NETIF_CTRL_TYPE_DEL_GREF_MAPPING:
+		status = xenvif_del_gref_mapping(vif, req->data[0],
+						 req->data[1],
+						 req->data[2],
+						 &data);
 		break;
 
 	default:

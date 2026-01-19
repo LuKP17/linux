@@ -95,6 +95,8 @@ static int xenvif_read_io_ring(struct seq_file *m, void *v)
 		   queue->rx_queue_len, queue->rx_queue_max,
 		   skb_queue_len(&queue->rx_queue),
 		   netif_tx_queue_stopped(dev_queue) ? "stopped" : "running");
+	
+	xenvif_dump_grant_info(queue, m);
 
 	return 0;
 }
