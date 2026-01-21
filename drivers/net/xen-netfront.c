@@ -84,6 +84,7 @@ struct netfront_cb {
 
 #define NET_TX_RING_SIZE __CONST_RING_SIZE(xen_netif_tx, XEN_PAGE_SIZE)
 #define NET_RX_RING_SIZE __CONST_RING_SIZE(xen_netif_rx, XEN_PAGE_SIZE)
+#define NET_CTRL_RING_SIZE __CONST_RING_SIZE(xen_netif_ctrl, XEN_PAGE_SIZE)
 
 /* Minimum number of Rx slots (includes slot for GSO metadata). */
 #define NET_RX_SLOTS_MIN (XEN_NETIF_NR_SLOTS_MIN + 1)
@@ -163,6 +164,15 @@ struct netfront_info {
 
 	struct xenbus_device *xbdev;
 
+	/* Control ring support */
+	unsigned int ctrl_evtchn;
+	unsigned int ctrl_irq;
+	char ctrl_irq_name[IRQ_NAME_SIZE]; /* DEVNAME-ctrl */
+	struct xen_netif_ctrl_front_ring ctrl;
+	int ctrl_ring_ref;
+	struct completion ctrl_free;
+	spinlock_t ctrl_lock;
+
 	/* Multi-queue support */
 	struct netfront_queue *queues;
 
@@ -213,6 +223,11 @@ static unsigned short get_id_from_list(unsigned *head, unsigned short *list)
 static int xennet_rxidx(RING_IDX idx)
 {
 	return idx & (NET_RX_RING_SIZE - 1);
+}
+
+static int xennet_ctrlidx(RING_IDX idx)
+{
+	return idx & (NET_CTRL_RING_SIZE - 1);
 }
 
 static struct sk_buff *xennet_get_rx_skb(struct netfront_queue *queue,
@@ -1515,6 +1530,45 @@ static int xennet_set_features(struct net_device *dev,
 	return 0;
 }
 
+static struct xen_netif_ctrl_response *xennet_send_ctrlmsg(
+			struct netfront_info *info, u16 type, u32 *data)
+{
+	struct xen_netif_ctrl_response *rsp;
+	struct xen_netif_ctrl_request *req;
+	int more_to_do, notify;
+	RING_IDX id;
+
+	spin_lock(&info->ctrl_lock);
+	reinit_completion(&info->ctrl_free);
+
+	id = xennet_ctrlidx(info->ctrl.req_prod_pvt);
+	req = RING_GET_REQUEST(&info->ctrl, info->ctrl.req_prod_pvt++);
+	req->id = id;
+	req->type = type;
+	req->data[0] = data[0];
+	req->data[1] = data[1];
+	req->data[2] = data[2];
+
+	RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&info->ctrl, notify);
+	if (notify)
+		notify_remote_via_irq(info->ctrl_irq);
+
+	wait_for_completion(&info->ctrl_free);
+	rsp = RING_GET_RESPONSE(&info->ctrl, info->ctrl.rsp_cons++);
+	RING_FINAL_CHECK_FOR_RESPONSES(&info->ctrl, more_to_do);
+	spin_unlock(&info->ctrl_lock);
+
+	return rsp;
+}
+
+static irqreturn_t xennet_ctrl_interrupt(int irq, void *dev_id)
+{
+	struct netfront_info *info = dev_id;
+	complete(&info->ctrl_free);
+
+	return IRQ_HANDLED;
+}
+
 static bool xennet_handle_tx(struct netfront_queue *queue, unsigned int *eoi)
 {
 	unsigned long flags;
@@ -1823,6 +1877,14 @@ static void xennet_disconnect_backend(struct netfront_info *info)
 
 	netif_carrier_off(info->netdev);
 
+	if (info->ctrl_ring_ref != INVALID_GRANT_REF) {
+		unbind_from_irqhandler(info->ctrl_irq, info);
+		info->ctrl_evtchn = info->ctrl_irq = 0;
+		xennet_end_access(info->ctrl_ring_ref, info->ctrl.sring);
+		info->ctrl_ring_ref = INVALID_GRANT_REF;
+		info->ctrl.sring = NULL;
+	}
+
 	for (i = 0; i < num_queues && info->queues; ++i) {
 		struct netfront_queue *queue = &info->queues[i];
 
@@ -1904,6 +1966,49 @@ static int xen_net_read_mac(struct xenbus_device *dev, u8 mac[])
 
 	kfree(macstr);
 	return 0;
+}
+
+static int setup_netfront_control(struct xenbus_device *dev)
+{
+	struct netfront_info *info = dev_get_drvdata(&dev->dev);
+	struct xen_netif_ctrl_sring *ctrls;
+	int err;
+
+	info->ctrl_ring_ref = INVALID_GRANT_REF;
+	info->ctrl.sring = NULL;
+
+	err = xenbus_setup_ring(dev, GFP_NOIO | __GFP_HIGH, (void **)&ctrls,
+				1, &info->ctrl_ring_ref);
+	if (err)
+		goto fail;
+
+	XEN_FRONT_RING_INIT(&info->ctrl, ctrls, XEN_PAGE_SIZE);
+
+	err = xenbus_alloc_evtchn(dev, &info->ctrl_evtchn);
+	if (err < 0)
+		goto fail;
+
+	snprintf(info->ctrl_irq_name, sizeof(info->ctrl_irq_name),
+		 "%s-ctrl", info->netdev->name);
+	err = bind_evtchn_to_irqhandler(info->ctrl_evtchn,
+					xennet_ctrl_interrupt, 0,
+					info->ctrl_irq_name, info);
+	if (err < 0)
+		goto bind_evtchn_fail;
+	info->ctrl_irq = err;
+
+	spin_lock_init(&info->ctrl_lock);
+	init_completion(&info->ctrl_free);
+
+	return 0;
+
+bind_evtchn_fail:
+	xenbus_free_evtchn(info->xbdev, info->ctrl_evtchn);
+	info->ctrl_evtchn = 0;
+fail:
+	xenbus_teardown_ring((void **)&info->ctrl.sring, 1, &info->ctrl_ring_ref);
+
+	return err;
 }
 
 static int setup_netfront_single(struct netfront_queue *queue)
@@ -2080,6 +2185,35 @@ static int xennet_init_queue(struct netfront_queue *queue)
  exit_free_tx:
 	gnttab_free_grant_references(queue->gref_tx_head);
  exit:
+	return err;
+}
+
+static int write_ctrl_xenstore_keys(struct netfront_info *info,
+			   struct xenbus_transaction *xbt)
+{
+	struct xenbus_device *dev = info->xbdev;
+	char *path= (char *)dev->nodename;
+	const char *message;
+	int err;
+
+	err = xenbus_printf(*xbt, path, "ctrl-ring-ref", "%u",
+			    info->ctrl_ring_ref);
+	if (err) {
+		message = "writing ctrl-ring-ref";
+		goto error;
+	}
+
+	err = xenbus_printf(*xbt, path, "event-channel-ctrl", "%u",
+			    info->ctrl_evtchn);
+	if (err) {
+		message = "writing event-channel-ctrl";
+		goto error;
+	}
+
+	return 0;
+
+error:
+	xenbus_dev_fatal(dev, err, "%s", message);
 	return err;
 }
 
@@ -2264,7 +2398,7 @@ static int talk_to_netback(struct xenbus_device *dev,
 	const char *message;
 	struct xenbus_transaction xbt;
 	int err;
-	unsigned int feature_split_evtchn;
+	unsigned int feature_ctrl_ring, feature_split_evtchn;
 	unsigned int i = 0;
 	unsigned int max_queues = 0;
 	struct netfront_queue *queue = NULL;
@@ -2281,6 +2415,15 @@ static int talk_to_netback(struct xenbus_device *dev,
 	max_queues = xenbus_read_unsigned(info->xbdev->otherend,
 					  "multi-queue-max-queues", 1);
 	num_queues = min(max_queues, xennet_max_queues);
+
+	/* Check feature-ctrl-ring */
+	feature_ctrl_ring = xenbus_read_unsigned(info->xbdev->otherend,
+						 "feature-ctrl-ring", 0);
+	if (feature_ctrl_ring) {
+		err = setup_netfront_control(dev);
+		if (err < 0)
+			feature_ctrl_ring = 0;
+	}
 
 	/* Check feature-split-event-channels */
 	feature_split_evtchn = xenbus_read_unsigned(info->xbdev->otherend,
@@ -2362,6 +2505,12 @@ again:
 	}
 
 	/* The remaining keys are not queue-specific */
+	if (feature_ctrl_ring) {
+		err = write_ctrl_xenstore_keys(info, &xbt);
+		if (err)
+			goto abort_transaction_no_dev_fatal;
+	}
+
 	err = xenbus_printf(xbt, dev->nodename, "request-rx-copy", "%u",
 			    1);
 	if (err) {
