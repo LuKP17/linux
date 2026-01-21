@@ -66,6 +66,12 @@ module_param_named(max_queues, xennet_max_queues, uint, 0644);
 MODULE_PARM_DESC(max_queues,
 		 "Maximum number of queues per virtual interface");
 
+
+static unsigned int xennet_staging_grants = 1;
+module_param_named(staging_grants, xennet_staging_grants, uint, 0644);
+MODULE_PARM_DESC(staging_grants,
+		 "Staging grants support (0=off, 1=on [default]");
+
 static bool __read_mostly xennet_trusted = true;
 module_param_named(trusted, xennet_trusted, bool, 0644);
 MODULE_PARM_DESC(trusted, "Is the backend trusted");
@@ -86,7 +92,7 @@ struct netfront_cb {
 #define NET_RX_RING_SIZE __CONST_RING_SIZE(xen_netif_rx, XEN_PAGE_SIZE)
 #define NET_CTRL_RING_SIZE __CONST_RING_SIZE(xen_netif_ctrl, XEN_PAGE_SIZE)
 
-/* Minimum number of Rx slots (includes slot for GSO metadata). */
+/* Minimum number of RX slots (includes slot for GSO metadata). */
 #define NET_RX_SLOTS_MIN (XEN_NETIF_NR_SLOTS_MIN + 1)
 
 /* Queue name is interface name with "-qNNN" appended */
@@ -101,6 +107,22 @@ struct netfront_stats {
 	u64			packets;
 	u64			bytes;
 	struct u64_stats_sync	syncp;
+};
+
+struct netfront_buffer {
+	grant_ref_t ref;
+	struct page *page;
+};
+
+struct netfront_buffer_info {
+	grant_ref_t gref_head;
+	unsigned skb_freelist;
+	unsigned int count;
+	struct netfront_buffer *bufs;
+
+	/* For grant/revoking the list of buffers */
+	struct xen_netif_gref *map;
+	grant_ref_t ref;
 };
 
 struct netfront_info;
@@ -150,6 +172,9 @@ struct netfront_queue {
 	struct sk_buff *rx_skbs[NET_RX_RING_SIZE];
 	grant_ref_t gref_rx_head;
 	grant_ref_t grant_rx_ref[NET_RX_RING_SIZE];
+
+	/* TX/RX buffers premapped with the backend */
+	struct netfront_buffer_info tx_binfo, rx_binfo;
 
 	unsigned int rx_rsp_unconsumed;
 	spinlock_t rx_cons_lock;
@@ -1530,37 +1555,6 @@ static int xennet_set_features(struct net_device *dev,
 	return 0;
 }
 
-static struct xen_netif_ctrl_response *xennet_send_ctrlmsg(
-			struct netfront_info *info, u16 type, u32 *data)
-{
-	struct xen_netif_ctrl_response *rsp;
-	struct xen_netif_ctrl_request *req;
-	int more_to_do, notify;
-	RING_IDX id;
-
-	spin_lock(&info->ctrl_lock);
-	reinit_completion(&info->ctrl_free);
-
-	id = xennet_ctrlidx(info->ctrl.req_prod_pvt);
-	req = RING_GET_REQUEST(&info->ctrl, info->ctrl.req_prod_pvt++);
-	req->id = id;
-	req->type = type;
-	req->data[0] = data[0];
-	req->data[1] = data[1];
-	req->data[2] = data[2];
-
-	RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&info->ctrl, notify);
-	if (notify)
-		notify_remote_via_irq(info->ctrl_irq);
-
-	wait_for_completion(&info->ctrl_free);
-	rsp = RING_GET_RESPONSE(&info->ctrl, info->ctrl.rsp_cons++);
-	RING_FINAL_CHECK_FOR_RESPONSES(&info->ctrl, more_to_do);
-	spin_unlock(&info->ctrl_lock);
-
-	return rsp;
-}
-
 static irqreturn_t xennet_ctrl_interrupt(int irq, void *dev_id)
 {
 	struct netfront_info *info = dev_id;
@@ -1870,6 +1864,9 @@ static void xennet_end_access(int ref, void *page)
 		gnttab_end_foreign_access(ref, virt_to_page(page));
 }
 
+static void xennet_deinit_binfo(struct netfront_queue *queue,
+				struct netfront_buffer_info *binfo, bool rw);
+
 static void xennet_disconnect_backend(struct netfront_info *info)
 {
 	unsigned int i = 0;
@@ -1906,6 +1903,11 @@ static void xennet_disconnect_backend(struct netfront_info *info)
 		xennet_release_rx_bufs(queue);
 		gnttab_free_grant_references(queue->gref_tx_head);
 		gnttab_free_grant_references(queue->gref_rx_head);
+
+		if (queue->tx_binfo.count)
+			xennet_deinit_binfo(queue, &queue->tx_binfo, false);
+		if (queue->rx_binfo.count)
+			xennet_deinit_binfo(queue, &queue->rx_binfo, true);
 
 		/* End access and free the pages */
 		xennet_end_access(queue->tx_ring_ref, queue->tx.sring);
@@ -2299,7 +2301,236 @@ error:
 	return err;
 }
 
+static struct xen_netif_ctrl_response *xennet_send_ctrlmsg(
+			struct netfront_info *info, u16 type, u32 *data)
+{
+	struct xen_netif_ctrl_response *rsp;
+	struct xen_netif_ctrl_request *req;
+	int more_to_do, notify;
+	RING_IDX id;
 
+	spin_lock(&info->ctrl_lock);
+	reinit_completion(&info->ctrl_free);
+
+	id = xennet_ctrlidx(info->ctrl.req_prod_pvt);
+	req = RING_GET_REQUEST(&info->ctrl, info->ctrl.req_prod_pvt++);
+	req->id = id;
+	req->type = type;
+	req->data[0] = data[0];
+	req->data[1] = data[1];
+	req->data[2] = data[2];
+
+	RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&info->ctrl, notify);
+	if (notify)
+		notify_remote_via_irq(info->ctrl_irq);
+
+	wait_for_completion(&info->ctrl_free);
+	rsp = RING_GET_RESPONSE(&info->ctrl, info->ctrl.rsp_cons++);
+	RING_FINAL_CHECK_FOR_RESPONSES(&info->ctrl, more_to_do);
+	spin_unlock(&info->ctrl_lock);
+
+	return rsp;
+}
+
+static int xennet_get_gref_map_size(struct netfront_info *info)
+{
+	struct xen_netif_ctrl_response *rsp;
+	u32 data[3] = { 0, 0, 0 };
+
+	rsp = xennet_send_ctrlmsg(info,
+				  XEN_NETIF_CTRL_TYPE_GET_GREF_MAPPING_SIZE,
+				  data);
+
+	return (rsp->status != XEN_NETIF_CTRL_STATUS_SUCCESS) ? 0 : rsp->data;
+}
+
+static int xennet_add_gref_map(struct netfront_queue *queue, grant_ref_t ref,
+			       unsigned int count)
+{
+	u32 data[3] = { queue->id, ref, count };
+	struct xen_netif_ctrl_response *rsp;
+
+	rsp = xennet_send_ctrlmsg(queue->info,
+				  XEN_NETIF_CTRL_TYPE_ADD_GREF_MAPPING, data);
+
+	return rsp->data != count ||
+	       rsp->status != XEN_NETIF_CTRL_STATUS_SUCCESS;
+}
+
+static int xennet_del_gref_map(struct netfront_queue *queue, grant_ref_t ref,
+			       unsigned int count)
+{
+	u32 data[3] = { queue->id, ref, count };
+	struct xen_netif_ctrl_response *rsp;
+
+	rsp = xennet_send_ctrlmsg(queue->info,
+				  XEN_NETIF_CTRL_TYPE_DEL_GREF_MAPPING, data);
+
+	return rsp->data != count ||
+	       rsp->status != XEN_NETIF_CTRL_STATUS_SUCCESS;
+}
+
+static int xennet_grant_binfo(struct netfront_queue *queue,
+			      struct netfront_buffer_info *binfo, bool rw)
+{
+	const domid_t otherend_id = queue->info->xbdev->otherend_id;
+	struct xen_netif_gref *tbl;
+	grant_ref_t ref;
+	int i, j;
+
+	tbl = (struct xen_netif_gref *)get_zeroed_page(GFP_KERNEL);
+	if (!tbl)
+		return -ENOMEM;
+
+	for (i = 0; i < binfo->count; i++) {
+		struct page *page;
+
+		page = alloc_page(GFP_KERNEL);
+		if (!page)
+			goto fail;
+
+		ref = gnttab_claim_grant_reference(&binfo->gref_head);
+
+		if (IS_ERR_VALUE((unsigned long)(int)ref))
+			goto fail;
+
+		gnttab_page_grant_foreign_access_ref_one(ref, otherend_id, page,
+							rw ? 0 : GNTMAP_readonly);
+
+		tbl[i].ref = ref;
+		tbl[i].flags = rw ? 0 : XEN_NETIF_CTRLF_GREF_readonly;
+
+		binfo->bufs[i].page = page;
+		binfo->bufs[i].ref = ref;
+	}
+
+	ref = gnttab_grant_foreign_access(otherend_id,
+					  virt_to_gfn((void *)tbl), 0);
+	if (ref < 0)
+		goto fail;
+
+	if (xennet_add_gref_map(queue, ref, binfo->count)) {
+		xennet_del_gref_map(queue, ref, binfo->count);
+		gnttab_end_foreign_access_ref(ref);
+		goto fail;
+	}
+
+	binfo->map = tbl;
+	binfo->ref = ref;
+	return 0;
+
+fail:
+	for (j = 0; j < i; j++) {
+		gnttab_end_foreign_access_ref(tbl[j].ref);
+		__free_page(binfo->bufs[j].page);
+	}
+	free_page((unsigned long)tbl);
+	return -ENOMEM;
+}
+
+static void xennet_revoke_binfo(struct netfront_queue *queue,
+			        struct netfront_buffer_info *binfo, bool rw)
+{
+	int i;
+
+	for (i = 0; i < binfo->count; i++) {
+		struct netfront_buffer *buf = &binfo->bufs[i];
+		struct page *page = buf->page;
+
+		if (buf->ref == INVALID_GRANT_REF)
+			continue;
+
+		get_page(page);
+		gnttab_end_foreign_access(buf->ref, page);
+		buf->page = NULL;
+		buf->ref = INVALID_GRANT_REF;
+	}
+
+	gnttab_end_foreign_access_ref(binfo->ref);
+	free_page((unsigned long)binfo->map);
+	binfo->map = NULL;
+	binfo->ref = INVALID_GRANT_REF;
+}
+
+/* Grants an amount of buffers for a selected ring size. This granted region is
+ * then given to the backend to map and hence for this set the grant ops are
+ * guaranteed to be avoided.
+ */
+static int xennet_init_binfo(struct netfront_queue *queue,
+			     struct netfront_buffer_info *binfo,
+			     unsigned int size, bool rw)
+{
+	unsigned short i;
+
+	/* A grant for every ring slot */
+	if (gnttab_alloc_grant_references(size, &binfo->gref_head) < 0) {
+		pr_alert("can't alloc grant refs\n");
+		return -ENOMEM;
+	}
+
+	binfo->bufs = kcalloc(size, sizeof(struct netfront_buffer), GFP_KERNEL);
+	if (!binfo->bufs) {
+		gnttab_free_grant_references(binfo->gref_head);
+		return -ENOMEM;
+	}
+
+	binfo->count = size;
+	for (i = 0; i < size; i++) {
+		binfo->bufs[i].ref = INVALID_GRANT_REF;
+		binfo->bufs[i].page = NULL;
+	}
+
+	if (xennet_grant_binfo(queue, binfo, rw))
+		return -ENOMEM;
+
+	return 0;
+}
+
+static void xennet_deinit_binfo(struct netfront_queue *queue,
+			        struct netfront_buffer_info *binfo, bool rw)
+{
+	xennet_revoke_binfo(queue, binfo, rw);
+
+	kfree(binfo->bufs);
+	binfo->bufs = NULL;
+	gnttab_free_grant_references(binfo->gref_head);
+}
+
+/* Requests backend to map TX/RX buffers */
+static void setup_staging_grants(struct xenbus_device *dev,
+				 struct netfront_queue *queue,
+				 unsigned int max_grefs)
+{
+	int err;
+
+	if (max_grefs < NET_RX_RING_SIZE) {
+		if (max_grefs >= NET_TX_RING_SIZE)
+			goto map_tx;
+		return;
+	}
+
+	err = xennet_init_binfo(queue, &queue->rx_binfo,
+				NET_RX_RING_SIZE, true);
+	if (err) {
+		dev_warn(&dev->dev, "queue-%d: failed to premap RX buffers",
+			 queue->id);
+		return;
+	}
+
+	max_grefs -= NET_RX_RING_SIZE;
+	if (max_grefs < NET_TX_RING_SIZE) {
+		dev_warn(&dev->dev, "queue-%d: only mapped %lu grefs ",
+			 queue->id, NET_RX_RING_SIZE);
+		return;
+	}
+
+map_tx:
+	err = xennet_init_binfo(queue, &queue->tx_binfo,
+				NET_TX_RING_SIZE, false);
+	if (err)
+		dev_warn(&dev->dev, "queue-%d: failed to premap TX buffers",
+			 queue->id);
+}
 
 static int xennet_create_page_pool(struct netfront_queue *queue)
 {
@@ -2640,6 +2871,27 @@ static int xennet_connect(struct net_device *dev)
 }
 
 /*
+ * Runs when backend is connected, which is when the control ring is ready.
+ */
+static void xennet_connected(struct net_device *dev)
+{
+	struct netfront_info *np = netdev_priv(dev);
+	unsigned int max_grefs, i;
+
+	/* No control ring or staging grefs requested */
+	if (!np->ctrl_irq || !xennet_staging_grants)
+		return;
+
+	/* Backend does not allow permanent grant mappings */
+	max_grefs = xennet_get_gref_map_size(np);
+	if (!max_grefs)
+               return;
+
+	for (i = 0; i < dev->real_num_tx_queues; ++i)
+		setup_staging_grants(np->xbdev, &np->queues[i], max_grefs);
+}
+
+/*
  * Callback received when the backend's state changes.
  */
 static void netback_changed(struct xenbus_device *dev,
@@ -2669,6 +2921,7 @@ static void netback_changed(struct xenbus_device *dev,
 		break;
 
 	case XenbusStateConnected:
+		xennet_connected(netdev);
 		netdev_notify_peers(netdev);
 		break;
 
