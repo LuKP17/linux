@@ -2340,7 +2340,7 @@ static struct xen_netif_ctrl_response *xennet_send_ctrlmsg(
 	int more_to_do, notify;
 	RING_IDX id;
 
-	spin_lock(&info->ctrl_lock);
+	//spin_lock(&info->ctrl_lock);
 	reinit_completion(&info->ctrl_free);
 
 	id = xennet_ctrlidx(info->ctrl.req_prod_pvt);
@@ -2358,7 +2358,7 @@ static struct xen_netif_ctrl_response *xennet_send_ctrlmsg(
 	wait_for_completion(&info->ctrl_free);
 	rsp = RING_GET_RESPONSE(&info->ctrl, info->ctrl.rsp_cons++);
 	RING_FINAL_CHECK_FOR_RESPONSES(&info->ctrl, more_to_do);
-	spin_unlock(&info->ctrl_lock);
+	//spin_unlock(&info->ctrl_lock);
 
 	return rsp;
 }
