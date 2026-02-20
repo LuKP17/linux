@@ -56,7 +56,8 @@ void xenvif_skb_zerocopy_prepare(struct xenvif_queue *queue,
 	atomic_inc(&queue->inflight_packets);
 }
 
-void xenvif_skb_zerocopy_complete(struct xenvif_queue *queue)
+void xenvif_skb_zerocopy_complete(struct xenvif_queue *queue,
+				unsigned int pending_dealloc)
 {
 	atomic_dec(&queue->inflight_packets);
 
@@ -64,7 +65,8 @@ void xenvif_skb_zerocopy_complete(struct xenvif_queue *queue)
 	 * that if kthread_stop() has already been called, the dealloc thread
 	 * does not wait forever with nothing to wake it.
 	 */
-	wake_up(&queue->dealloc_wq);
+	if (pending_dealloc)
+		wake_up(&queue->dealloc_wq);
 }
 
 static int xenvif_schedulable(struct xenvif *vif)
@@ -591,12 +593,18 @@ int xenvif_init_queue(struct xenvif_queue *queue)
 		return -ENOMEM;
 	}
 
+	if (queue->vif->persistent_grants) {
+		queue->persistent_gnts.rb_node = NULL;
+		queue->persistent_gnt_c = 0;
+	}
+
 	for (i = 0; i < MAX_PENDING_REQS; i++) {
 		queue->pending_tx_info[i].callback_struct = (struct ubuf_info_msgzc)
 			{ { .ops = &xenvif_ubuf_ops },
 			  { { .ctx = NULL,
 			      .desc = i } } };
 		queue->grant_tx_handle[i] = NETBACK_INVALID_HANDLE;
+		queue->tx_pgrants[i] = NULL;
 	}
 
 	return 0;
@@ -698,6 +706,10 @@ static void xenvif_disconnect_queue(struct xenvif_queue *queue)
 	}
 
 	xenvif_unmap_frontend_data_rings(queue);
+
+	if (queue->vif->persistent_grants) {
+		xenvif_pgrants_destroy(queue);
+	}
 }
 
 int xenvif_connect_data(struct xenvif_queue *queue,
