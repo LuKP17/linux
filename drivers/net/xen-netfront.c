@@ -2472,6 +2472,8 @@ static int xennet_connect(struct net_device *dev)
 		return err;
 	if (np->netback_has_xdp_headroom)
 		pr_info("backend supports XDP headroom\n");
+	if (np->persistent_grants)
+		pr_info("backend supports persistent grants\n");
 	if (np->bounce)
 		dev_info(&np->xbdev->dev,
 			 "bouncing transmitted data to zeroed pages\n");
