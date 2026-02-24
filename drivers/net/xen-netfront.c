@@ -67,10 +67,10 @@ MODULE_PARM_DESC(max_queues,
 		 "Maximum number of queues per virtual interface");
 
 
-static unsigned int xennet_staging_grants = 1;
-module_param_named(staging_grants, xennet_staging_grants, uint, 0644);
-MODULE_PARM_DESC(staging_grants,
-		 "Staging grants support (0=off, 1=on [default]");
+static unsigned int xennet_static_grants = 1;
+module_param_named(static_grants, xennet_static_grants, uint, 0644);
+MODULE_PARM_DESC(static_grants,
+		 "Static grants support (0=off, 1=on [default]");
 
 static bool __read_mostly xennet_trusted = true;
 module_param_named(trusted, xennet_trusted, bool, 0644);
@@ -2523,7 +2523,7 @@ static void xennet_deinit_binfo(struct netfront_queue *queue,
 }
 
 /* Requests backend to map TX/RX buffers */
-static void setup_staging_grants(struct xenbus_device *dev,
+static void setup_static_grants(struct xenbus_device *dev,
 				 struct netfront_queue *queue,
 				 unsigned int max_grefs)
 {
@@ -2904,8 +2904,8 @@ static void xennet_connected(struct net_device *dev)
 	struct netfront_info *np = netdev_priv(dev);
 	unsigned int max_grefs, i;
 
-	/* No control ring or staging grefs requested */
-	if (!np->ctrl_irq || !xennet_staging_grants)
+	/* No control ring or static grants requested */
+	if (!np->ctrl_irq || !xennet_static_grants)
 		return;
 
 	/* Backend does not allow permanent grant mappings */
@@ -2913,8 +2913,10 @@ static void xennet_connected(struct net_device *dev)
 	if (!max_grefs)
                return;
 
+	pr_info("backend supports static grants\n");
+
 	for (i = 0; i < dev->real_num_tx_queues; ++i)
-		setup_staging_grants(np->xbdev, &np->queues[i], max_grefs);
+		setup_static_grants(np->xbdev, &np->queues[i], max_grefs);
 }
 
 /*
