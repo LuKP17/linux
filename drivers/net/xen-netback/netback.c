@@ -97,11 +97,11 @@ unsigned int xenvif_hash_cache_size = XENVIF_HASH_CACHE_SIZE_DEFAULT;
 module_param_named(hash_cache_size, xenvif_hash_cache_size, uint, 0644);
 MODULE_PARM_DESC(hash_cache_size, "Number of flows in the hash cache");
 
-/* This is the maximum number of grefs in the mapping table. */
-#define XENVIF_GREF_MAPPING_SIZE_DEFAULT 768
+/* This is the maximum number of grants simultaneously mapped per queue. */
+#define XENVIF_GREF_MAPPING_SIZE_DEFAULT 512
 unsigned int xenvif_gref_mapping_size = XENVIF_GREF_MAPPING_SIZE_DEFAULT;
 module_param_named(gref_mapping_size, xenvif_gref_mapping_size, uint, 0644);
-MODULE_PARM_DESC(gref_mapping_size, "Number of grefs in the mapping table");
+MODULE_PARM_DESC(gref_mapping_size, "Number of grants simultaneously mapped per queue");
 
 /* The module parameter tells that we have to put data
  * for xen-netfront with the XDP_PACKET_HEADROOM offset
@@ -1748,8 +1748,7 @@ static void process_ctrl_request(struct xenvif *vif,
 	case XEN_NETIF_CTRL_TYPE_ADD_GREF_MAPPING:
 		status = xenvif_add_gref_mapping(vif, req->data[0],
 						 req->data[1],
-						 req->data[2],
-						 &data);
+						 req->data[2]);
 		break;
 
 	case XEN_NETIF_CTRL_TYPE_DEL_GREF_MAPPING:

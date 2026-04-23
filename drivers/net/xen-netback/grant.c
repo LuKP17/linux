@@ -99,6 +99,9 @@ static struct xenvif_grant *xenvif_new_grant(struct xenvif_queue *queue,
 			  (unsigned long)pfn_to_kaddr(page_to_pfn(page)),
 			  flags, ref, queue->vif->domid);
 
+	// TODO we are mapping grants one by one which isn't efficient at all.
+	// Use a struct gnttab_map_grant_ref *gop_map array that will be checked
+	// outside this function to handle mapping failures (all or nothing approach from the spec).
 	err = gnttab_map_refs(&gop, NULL, &page, 1);
 
 	if (err || gop.status != GNTST_okay)
@@ -194,6 +197,8 @@ static inline int xenvif_map_grefs(struct xenvif *vif, u32 queue_id,
 
 		readonly = (entries[i].flags & XEN_NETIF_CTRLF_GREF_readonly);
 		entry = xenvif_new_grant(queue, entries[i].ref, readonly);
+		// TODO the spec says black on white that this status field is not used, fucking hell
+		// it's all or nothing, so from the ambiguous spec we should unmap all mapped grants from this set
 		if (!entry)
 			entries[i].status =
 				XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER;
@@ -238,27 +243,28 @@ u32 xenvif_get_gref_mapping_size(struct xenvif *vif, u32 queue_id, u32 *num)
 	if (queue_id < 0 || queue_id >= vif->num_queues)
 		return XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER;
 
-	*num = xenvif_gref_mapping_size - vif->queues[queue_id].grant.count;
+	*num = xenvif_gref_mapping_size;
 
 	return XEN_NETIF_CTRL_STATUS_SUCCESS;
 }
 
 u32 xenvif_add_gref_mapping(struct xenvif *vif, u32 queue_id, grant_ref_t gref,
-			    u32 size, u32 *num)
+			    u32 size)
 {
 	struct xen_netif_gref *entries = NULL;
 	struct gnttab_map_grant_ref mop;
+	int num;
 
 	entries = (struct xen_netif_gref *)
 		xenvif_map_table(vif, queue_id, gref, &mop);
 	if (!entries)
 		return XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER;
 
-	*num = xenvif_map_grefs(vif, queue_id, entries, size);
+	num = xenvif_map_grefs(vif, queue_id, entries, size);
 
 	xenvif_unmap_table(vif, queue_id, &mop);
 
-	return *num != 0 ? XEN_NETIF_CTRL_STATUS_SUCCESS :
+	return num == size ? XEN_NETIF_CTRL_STATUS_SUCCESS :
 		XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER;
 }
 

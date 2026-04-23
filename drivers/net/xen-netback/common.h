@@ -132,9 +132,10 @@ struct xenvif_copy_state {
 	struct sk_buff_head *completed;
 };
 
-/* This is the maximum number of grefs per queue in the grant cache. */
-#define XEN_NETBK_MAX_GREF_MAPPING_SIZE 1024
+/* This is the maximum number of entries per queue in a grant hash table. */
+#define XEN_NETBK_MAX_GREF_MAPPING_SIZE 512
 
+/* Entry in the static grants hash table */
 struct xenvif_grant {
 	grant_ref_t ref;
 	grant_handle_t handle;
@@ -144,6 +145,7 @@ struct xenvif_grant {
 	atomic_t refcount;
 };
 
+/* Static grants hash table */
 struct xenvif_grant_mapping {
 	struct hlist_head entries[XEN_NETBK_MAX_GREF_MAPPING_SIZE];
 	unsigned int count;
@@ -183,7 +185,7 @@ struct xenvif_queue { /* Per-queue data for xenvif */
 	u16 pending_ring[MAX_PENDING_REQS];
 	struct pending_tx_info pending_tx_info[MAX_PENDING_REQS];
 	grant_handle_t grant_tx_handle[MAX_PENDING_REQS];
-	/* TX pregranted buffers in use */
+	/* Inflight TX static grants */
 	struct xenvif_grant *tx_grants[MAX_PENDING_REQS];
 
 	struct gnttab_copy tx_copy_ops[2 * MAX_PENDING_REQS];
@@ -233,7 +235,7 @@ struct xenvif_queue { /* Per-queue data for xenvif */
 	u64 credit_window_start;
 	bool rate_limited;
 
-	/* Static grant mappings */
+	/* Static grants hash table (for TX and RX) */
 	struct xenvif_grant_mapping grant;
 
 	/* Statistics */
@@ -467,11 +469,11 @@ struct xenvif_grant *xenvif_get_grant(struct xenvif_queue *queue,
 				      grant_ref_t ref);
 void xenvif_put_grant(struct xenvif_queue *queue, struct xenvif_grant *grant);
 
+u32 xenvif_get_gref_mapping_size(struct xenvif *vif, u32 queue_id, u32 *num);
 u32 xenvif_add_gref_mapping(struct xenvif *vif, u32 queue_id, grant_ref_t ref,
-			    u32 size, u32 *num);
+			    u32 size);
 u32 xenvif_del_gref_mapping(struct xenvif *vif, u32 queue_id, grant_ref_t ref,
 			    u32 size, u32 *num);
-u32 xenvif_get_gref_mapping_size(struct xenvif *vif, u32 queue_id, u32 *num);
 
 #ifdef CONFIG_DEBUG_FS
 void xenvif_dump_hash_info(struct xenvif *vif, struct seq_file *m);

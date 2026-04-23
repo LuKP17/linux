@@ -70,7 +70,7 @@ MODULE_PARM_DESC(max_queues,
 static unsigned int xennet_static_grants = 1;
 module_param_named(static_grants, xennet_static_grants, uint, 0644);
 MODULE_PARM_DESC(static_grants,
-		 "Static grants support (0=off, 1=on [default]");
+		 "Static grants feature (0=off, 1=on [default]");
 
 static bool __read_mostly xennet_trusted = true;
 module_param_named(trusted, xennet_trusted, bool, 0644);
@@ -109,18 +109,21 @@ struct netfront_stats {
 	struct u64_stats_sync	syncp;
 };
 
+/* Static grant */
 struct netfront_buffer {
 	grant_ref_t ref;
 	struct page *page;
 };
 
+/* Static grants buffer metadata */
 struct netfront_buffer_info {
 	grant_ref_t gref_head;
 	unsigned skb_freelist;
-	unsigned int count;
+	/* Array of static grants (because kcalloc'd) */
 	struct netfront_buffer *bufs;
+	unsigned int count;
 
-	/* For grant/revoking the list of buffers */
+	/* Grant set (see XSM26 slides) */
 	struct xen_netif_gref *map;
 	grant_ref_t ref;
 };
@@ -173,7 +176,7 @@ struct netfront_queue {
 	grant_ref_t gref_rx_head;
 	grant_ref_t grant_rx_ref[NET_RX_RING_SIZE];
 
-	/* TX/RX buffers premapped with the backend */
+	/* Static grants */
 	struct netfront_buffer_info tx_binfo, rx_binfo;
 
 	unsigned int rx_rsp_unconsumed;
@@ -196,7 +199,7 @@ struct netfront_info {
 	struct xen_netif_ctrl_front_ring ctrl;
 	int ctrl_ring_ref;
 	struct completion ctrl_free;
-	spinlock_t ctrl_lock;
+	spinlock_t ctrl_lock; // unused
 
 	/* Multi-queue support */
 	struct netfront_queue *queues;
@@ -541,8 +544,11 @@ static void xennet_tx_setup_grant(unsigned long gfn, unsigned int offset,
 	id = get_id_from_list(&queue->tx_skb_freelist, queue->tx_link);
 	tx = RING_GET_REQUEST(&queue->tx, queue->tx.req_prod_pvt++);
 
+	/* TODO find a better condition as in the current state I suspect it to be > 0 even
+	 * when BE fails to map all static grants and the FE falls back to normal grants.
+	 */
 	if (queue->tx_binfo.count) {
-		/* use premapped grant */
+		/* use static grant */
 		struct netfront_buffer *buf = &queue->tx_binfo.bufs[id];
 
 		ref = buf->ref;
@@ -1499,7 +1505,7 @@ static void xennet_release_tx_bufs(struct netfront_queue *queue)
 		queue->tx_skbs[i] = NULL;
 
 		/* Premapped grant references are instead revoked on
-		 * xennet_deinit_grant_pool()
+		 * xennet_deinit_binfo()
 		 */
 		if (xennet_tx_gref_mapped(queue, i)) {
 			xennet_release_tx_single(queue, skb, i);
@@ -2208,6 +2214,9 @@ static int xennet_init_queue(struct netfront_queue *queue)
 		goto exit_free_tx;
 	}
 
+	queue->tx_binfo.count = 0;
+	queue->rx_binfo.count = 0;
+
 	return 0;
 
  exit_free_tx:
@@ -2358,16 +2367,16 @@ static struct xen_netif_ctrl_response *xennet_send_ctrlmsg(
 	return rsp;
 }
 
-static int xennet_get_gref_map_size(struct netfront_info *info)
+static int xennet_get_gref_map_size(struct netfront_queue *queue)
 {
 	struct xen_netif_ctrl_response *rsp;
-	u32 data[3] = { 0, 0, 0 };
+	u32 data[3] = { queue->id, 0, 0 };
 
-	rsp = xennet_send_ctrlmsg(info,
+	rsp = xennet_send_ctrlmsg(queue->info,
 				  XEN_NETIF_CTRL_TYPE_GET_GREF_MAPPING_SIZE,
 				  data);
 
-	return (rsp->status != XEN_NETIF_CTRL_STATUS_SUCCESS) ? 0 : rsp->data;
+	return (rsp->status == XEN_NETIF_CTRL_STATUS_SUCCESS) ? rsp->data : 0;
 }
 
 static int xennet_add_gref_map(struct netfront_queue *queue, grant_ref_t ref,
@@ -2379,8 +2388,7 @@ static int xennet_add_gref_map(struct netfront_queue *queue, grant_ref_t ref,
 	rsp = xennet_send_ctrlmsg(queue->info,
 				  XEN_NETIF_CTRL_TYPE_ADD_GREF_MAPPING, data);
 
-	return rsp->data != count ||
-	       rsp->status != XEN_NETIF_CTRL_STATUS_SUCCESS;
+	return rsp->status != XEN_NETIF_CTRL_STATUS_SUCCESS;
 }
 
 static int xennet_del_gref_map(struct netfront_queue *queue, grant_ref_t ref,
@@ -2404,6 +2412,7 @@ static int xennet_grant_binfo(struct netfront_queue *queue,
 	grant_ref_t ref;
 	int i, j;
 
+	/* Allocate static grant set page and fill it from the beginning */
 	tbl = (struct xen_netif_gref *)get_zeroed_page(GFP_KERNEL);
 	if (!tbl)
 		return -ENOMEM;
@@ -2423,9 +2432,11 @@ static int xennet_grant_binfo(struct netfront_queue *queue,
 		gnttab_page_grant_foreign_access_ref_one(ref, otherend_id, page,
 							rw ? 0 : GNTMAP_readonly);
 
+		/* Fill static grant set entry */
 		tbl[i].ref = ref;
 		tbl[i].flags = rw ? 0 : XEN_NETIF_CTRLF_GREF_readonly;
 
+		/* Fill static grant frontend struct */
 		binfo->bufs[i].page = page;
 		binfo->bufs[i].ref = ref;
 	}
@@ -2435,17 +2446,20 @@ static int xennet_grant_binfo(struct netfront_queue *queue,
 	if (ref < 0)
 		goto fail;
 
+	/* Ask backend to map binfo->count static grants */
 	if (xennet_add_gref_map(queue, ref, binfo->count)) {
-		xennet_del_gref_map(queue, ref, binfo->count);
 		gnttab_end_foreign_access_ref(ref);
 		goto fail;
 	}
 
+	// I don't think revoking access to the grant set page is needed since it's a zeroed page
+	// and the backend is not forced to unmap it.
 	binfo->map = tbl;
 	binfo->ref = ref;
 	return 0;
 
 fail:
+	binfo->count = 0; // Added it since it is set to the ring size at this point
 	for (j = 0; j < i; j++) {
 		gnttab_end_foreign_access_ref(tbl[j].ref);
 		__free_page(binfo->bufs[j].page);
@@ -2459,13 +2473,20 @@ static void xennet_revoke_binfo(struct netfront_queue *queue,
 {
 	int i;
 
+	// TODO call xennet_del_gref_map() here
 	for (i = 0; i < binfo->count; i++) {
 		struct netfront_buffer *buf = &binfo->bufs[i];
 		struct page *page = buf->page;
 
+		// TODO in what world is this true? If some static grants couldn't be mapped by BE?
+		// It's impossible with the current implementation (all static grants mapped or nothing)
+		// But for my own implementation it could be the case.
 		if (buf->ref == INVALID_GRANT_REF)
 			continue;
 
+		/* gnttab_end_foreign_access() needs a page ref until
+		 * foreign access is ended (which may be deferred).
+		 */
 		get_page(page);
 		gnttab_end_foreign_access(buf->ref, page);
 		buf->page = NULL;
@@ -2522,7 +2543,7 @@ static void xennet_deinit_binfo(struct netfront_queue *queue,
 	gnttab_free_grant_references(binfo->gref_head);
 }
 
-/* Requests backend to map TX/RX buffers */
+/* Request backend to map TX/RX static grants */
 static void setup_static_grants(struct xenbus_device *dev,
 				 struct netfront_queue *queue,
 				 unsigned int max_grefs)
@@ -2532,7 +2553,9 @@ static void setup_static_grants(struct xenbus_device *dev,
 	if (max_grefs < NET_RX_RING_SIZE) {
 		if (max_grefs >= NET_TX_RING_SIZE)
 			goto map_tx;
-		return;
+		// TODO if the factoring is clean, the driver should work in this case too.
+		// It's blocking the use of few static grants to have more scalability.
+		return;    /* Abort setup if we can't completely fill any ring */
 	}
 
 	err = xennet_init_binfo(queue, &queue->rx_binfo,
@@ -2897,26 +2920,24 @@ static int xennet_connect(struct net_device *dev)
 }
 
 /*
- * Runs when backend is connected, which is when the control ring is ready.
+ * Runs when backend is connected.
  */
 static void xennet_connected(struct net_device *dev)
 {
 	struct netfront_info *np = netdev_priv(dev);
 	unsigned int max_grefs, i;
+	unsigned int num_queues = dev->real_num_tx_queues;
 
-	/* No control ring or static grants requested */
-	if (!np->ctrl_irq || !xennet_static_grants)
+	/* No control ring or static grants disabled */
+	if (np->ctrl_ring_ref == INVALID_GRANT_REF || !xennet_static_grants) 
 		return;
 
-	/* Backend does not allow permanent grant mappings */
-	max_grefs = xennet_get_gref_map_size(np);
-	if (!max_grefs)
-               return;
-
-	pr_info("backend supports static grants\n");
-
-	for (i = 0; i < dev->real_num_tx_queues; ++i)
+	for (i = 0; i < num_queues; i++) {
+		max_grefs = xennet_get_gref_map_size(&np->queues[i]);
+		if (!max_grefs)
+			return;    /* Backend doesn't support static grants */
 		setup_static_grants(np->xbdev, &np->queues[i], max_grefs);
+	}
 }
 
 /*
