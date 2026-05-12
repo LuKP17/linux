@@ -41,7 +41,7 @@ static void *xenvif_map_table(struct xenvif *vif, u32 queue_id,
 		return NULL;
 
 	queue = &vif->queues[queue_id];
-	page = virt_to_page(queue->grant.opaque);
+	page = virt_to_page(queue->sgrants.opaque);
 
 	gnttab_set_map_op(gop,
 			  (unsigned long)pfn_to_kaddr(page_to_pfn(page)),
@@ -52,7 +52,7 @@ static void *xenvif_map_table(struct xenvif *vif, u32 queue_id,
 	if (err || gop->status != GNTST_okay)
 		return NULL;
 
-	return queue->grant.opaque;
+	return queue->sgrants.opaque;
 }
 
 static void xenvif_unmap_table(struct xenvif *vif, u32 queue_id,
@@ -63,7 +63,7 @@ static void xenvif_unmap_table(struct xenvif *vif, u32 queue_id,
 	struct page *page;
 	int err;
 
-	page = virt_to_page(queue->grant.opaque);
+	page = virt_to_page(queue->sgrants.opaque);
 
 	gnttab_set_unmap_op(&gop,
 			    (unsigned long)pfn_to_kaddr(page_to_pfn(page)),
@@ -74,10 +74,10 @@ static void xenvif_unmap_table(struct xenvif *vif, u32 queue_id,
 		netdev_dbg(vif->dev, "Unmap table fail: ret %d\n", err);
 }
 
-static struct xenvif_grant *xenvif_new_grant(struct xenvif_queue *queue,
+static struct xenvif_sgrant *xenvif_new_sgrant(struct xenvif_queue *queue,
 					     grant_ref_t ref, bool readonly)
 {
-	struct xenvif_grant *entry = NULL;
+	struct xenvif_sgrant *entry = NULL;
 	struct gnttab_map_grant_ref gop;
 	struct page *page = NULL;
 	uint32_t flags;
@@ -113,8 +113,8 @@ static struct xenvif_grant *xenvif_new_grant(struct xenvif_queue *queue,
 	entry->page = page;
 	atomic_set(&entry->refcount, 1);
 
-	hash_add(queue->grant.entries, &entry->node, entry->ref);
-	queue->grant.count++;
+	hash_add(queue->sgrants.entries, &entry->node, entry->ref);
+	queue->sgrants.count++;
 	return entry;
 
 err:
@@ -124,11 +124,11 @@ err:
 	return NULL;
 }
 
-static struct xenvif_grant *xenvif_find_grant(struct xenvif_queue *queue,
+static struct xenvif_sgrant *xenvif_find_sgrant(struct xenvif_queue *queue,
 					      grant_ref_t ref)
 {
-	struct xenvif_grant_mapping *table = &queue->grant;
-	struct xenvif_grant *entry = NULL;
+	struct xenvif_sgrant_mapping *table = &queue->sgrants;
+	struct xenvif_sgrant *entry = NULL;
 
 	hash_for_each_possible(table->entries, entry, node, ref) {
 		if (entry->ref == ref)
@@ -138,8 +138,8 @@ static struct xenvif_grant *xenvif_find_grant(struct xenvif_queue *queue,
 	return entry;
 }
 
-static int xenvif_remove_grant(struct xenvif_queue *queue,
-			       struct xenvif_grant *entry)
+static int xenvif_remove_sgrant(struct xenvif_queue *queue,
+			       struct xenvif_sgrant *entry)
 {
 	struct gnttab_unmap_grant_ref gop;
 	unsigned long addr;
@@ -157,7 +157,7 @@ static int xenvif_remove_grant(struct xenvif_queue *queue,
 		return -EINVAL;
 
 	hash_del(&entry->node);
-	queue->grant.count--;
+	queue->sgrants.count--;
 
 	gnttab_free_pages(1, &entry->page);
 	kfree(entry);
@@ -165,10 +165,10 @@ static int xenvif_remove_grant(struct xenvif_queue *queue,
 	return 0;
 }
 
-struct xenvif_grant *xenvif_get_grant(struct xenvif_queue *queue,
+struct xenvif_sgrant *xenvif_get_sgrant(struct xenvif_queue *queue,
 				      grant_ref_t ref)
 {
-	struct xenvif_grant *grant = xenvif_find_grant(queue, ref);
+	struct xenvif_sgrant *grant = xenvif_find_sgrant(queue, ref);
 
 	if (likely(grant))
 		atomic_inc(&grant->refcount);
@@ -176,10 +176,10 @@ struct xenvif_grant *xenvif_get_grant(struct xenvif_queue *queue,
 	return grant;
 }
 
-void xenvif_put_grant(struct xenvif_queue *queue, struct xenvif_grant *grant)
+void xenvif_put_sgrant(struct xenvif_queue *queue, struct xenvif_sgrant *grant)
 {
 	if (atomic_dec_and_test(&grant->refcount))
-		xenvif_remove_grant(queue, grant);
+		xenvif_remove_sgrant(queue, grant);
 }
 
 static inline int xenvif_map_grefs(struct xenvif *vif, u32 queue_id,
@@ -187,16 +187,16 @@ static inline int xenvif_map_grefs(struct xenvif *vif, u32 queue_id,
 				   u32 count)
 {
 	struct xenvif_queue *queue = &vif->queues[queue_id];
-	struct xenvif_grant *entry = NULL;
+	struct xenvif_sgrant *entry = NULL;
 	bool readonly;
 	int i;
 
 	for (i = 0; i < count; i++) {
-		if (queue->grant.count >= xenvif_gref_mapping_size)
+		if (queue->sgrants.count >= xenvif_gref_mapping_size)
 			break;
 
 		readonly = (entries[i].flags & XEN_NETIF_CTRLF_GREF_readonly);
-		entry = xenvif_new_grant(queue, entries[i].ref, readonly);
+		entry = xenvif_new_sgrant(queue, entries[i].ref, readonly);
 		// TODO the spec says black on white that this status field is not used, fucking hell
 		// it's all or nothing, so from the ambiguous spec we should unmap all mapped grants from this set
 		if (!entry)
@@ -212,12 +212,12 @@ static inline int xenvif_unmap_grefs(struct xenvif *vif, u32 queue_id,
 				     u32 count)
 {
 	struct xenvif_queue *queue = &vif->queues[queue_id];
-	struct xenvif_grant *entry;
+	struct xenvif_sgrant *entry;
 	int i;
 
 	for (i = 0; i < count; i++) {
-		entry = xenvif_find_grant(queue, entries[i].ref);
-		if (!entry || xenvif_remove_grant(queue, entry)) {
+		entry = xenvif_find_sgrant(queue, entries[i].ref);
+		if (!entry || xenvif_remove_sgrant(queue, entry)) {
 			entries[i].status =
 				XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER;
 			continue;
@@ -229,13 +229,13 @@ static inline int xenvif_unmap_grefs(struct xenvif *vif, u32 queue_id,
 
 static inline void xenvif_unmap_all_grefs(struct xenvif_queue *queue)
 {
-	struct xenvif_grant_mapping *table = &queue->grant;
-	struct xenvif_grant *entry = NULL;
+	struct xenvif_sgrant_mapping *table = &queue->sgrants;
+	struct xenvif_sgrant *entry = NULL;
 	struct hlist_node *tmp;
 	unsigned int bkt;
 
 	hash_for_each_safe(table->entries, bkt, tmp, entry, node)
-		xenvif_put_grant(queue, entry);
+		xenvif_put_sgrant(queue, entry);
 }
 
 u32 xenvif_get_gref_mapping_size(struct xenvif *vif, u32 queue_id, u32 *num)
@@ -287,7 +287,7 @@ u32 xenvif_del_gref_mapping(struct xenvif *vif, u32 queue_id, grant_ref_t gref,
 		XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER;
 }
 
-void xenvif_init_grant(struct xenvif_queue *queue)
+void xenvif_init_sgrant(struct xenvif_queue *queue)
 {
 	struct page *page;
 	int err;
@@ -296,27 +296,27 @@ void xenvif_init_grant(struct xenvif_queue *queue)
 	if (err)
 		return;
 
-	hash_init(queue->grant.entries);
-	queue->grant.opaque = (void *)page_to_virt(page);
+	hash_init(queue->sgrants.entries);
+	queue->sgrants.opaque = (void *)page_to_virt(page);
 }
 
-void xenvif_deinit_grant(struct xenvif_queue *queue)
+void xenvif_deinit_sgrant(struct xenvif_queue *queue)
 {
 	struct page *page;
 
-	if (!queue->grant.opaque)
+	if (!queue->sgrants.opaque)
 		return;
 
-	page = virt_to_page(queue->grant.opaque);
+	page = virt_to_page(queue->sgrants.opaque);
 	xenvif_unmap_all_grefs(queue);
 	gnttab_free_pages(1, &page);
 }
 
 #ifdef CONFIG_DEBUG_FS
-void xenvif_dump_grant_info(struct xenvif_queue *queue, struct seq_file *m)
+void xenvif_dump_sgrant_info(struct xenvif_queue *queue, struct seq_file *m)
 {
-	struct xenvif_grant_mapping *table = &queue->grant;
-	struct xenvif_grant *entry = NULL;
+	struct xenvif_sgrant_mapping *table = &queue->sgrants;
+	struct xenvif_sgrant *entry = NULL;
 	unsigned int bkt, i = 0;
 	struct hlist_node *tmp;
 

@@ -583,7 +583,7 @@ int xenvif_init_queue(struct xenvif_queue *queue)
 	spin_lock_init(&queue->callback_lock);
 	spin_lock_init(&queue->response_lock);
 
-	xenvif_init_grant(queue);
+	xenvif_init_sgrant(queue);
 
 	/* If ballooning is disabled, this will consume real memory, so you
 	 * better enable it. The long term solution would be to use just a
@@ -602,7 +602,7 @@ int xenvif_init_queue(struct xenvif_queue *queue)
 			  { { .ctx = NULL,
 			      .desc = i } } };
 		queue->grant_tx_handle[i] = NETBACK_INVALID_HANDLE;
-		queue->tx_grants[i] = NULL;
+		queue->tx_sgrants[i] = NULL;
 	}
 
 	return 0;
@@ -704,7 +704,7 @@ static void xenvif_disconnect_queue(struct xenvif_queue *queue)
 	}
 
 	xenvif_unmap_frontend_data_rings(queue);
-	xenvif_deinit_grant(queue);
+	xenvif_deinit_sgrant(queue);
 }
 
 int xenvif_connect_data(struct xenvif_queue *queue,
