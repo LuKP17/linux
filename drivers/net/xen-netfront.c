@@ -2566,6 +2566,8 @@ static void setup_static_grants(struct xenbus_device *dev,
 		return;
 	}
 
+	pr_info("network RX static grants initialized");
+
 	max_grefs -= NET_RX_RING_SIZE;
 	if (max_grefs < NET_TX_RING_SIZE) {
 		dev_warn(&dev->dev, "queue-%d: only mapped %lu grefs ",
@@ -2579,6 +2581,8 @@ map_tx:
 	if (err)
 		dev_warn(&dev->dev, "queue-%d: failed to premap TX buffers",
 			 queue->id);
+
+	pr_info("network TX static grants initialized");
 }
 
 static int xennet_create_page_pool(struct netfront_queue *queue)

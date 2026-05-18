@@ -261,32 +261,24 @@ static inline void xenvif_grant_handle_reset(struct xenvif_queue *queue,
 	queue->grant_tx_handle[pending_idx] = NETBACK_INVALID_HANDLE;
 }
 
-static void xenvif_tx_sgrant_reset(struct xenvif_queue *queue, u16 pending_idx)
+static void xenvif_tx_sgrant_reset(struct xenvif_queue *queue,
+				   u16 pending_idx)
 {
-	struct xenvif_sgrant *grant = queue->tx_sgrants[pending_idx];
+	struct xenvif_sgrant *sgrant = queue->tx_sgrants[pending_idx];
 
-	xenvif_put_sgrant(queue, grant);
+	xenvif_put_sgrant(queue, sgrant);
 	xenvif_grant_handle_reset(queue, pending_idx);
 	queue->tx_sgrants[pending_idx] = NULL;
-}
-
-static void xenvif_tx_sgrant_release(struct xenvif_queue *queue, u16 pending_idx)
-{
-	if (queue->tx_sgrants[pending_idx])
-		xenvif_tx_sgrant_reset(queue, pending_idx);
-	else
-		xenvif_idx_unmap(queue, pending_idx);
-	xenvif_idx_release(queue, pending_idx, XEN_NETIF_RSP_OKAY);
 }
 
 /* Checks if there's a sgrant available for gref and if so, set it also
  * in the tx_sgrants array that keeps the ones in flight.
  */
 static bool xenvif_tx_sgrant(struct xenvif_queue *queue, grant_ref_t ref,
-			    u16 pending_idx)
+			     u16 pending_idx)
 {
-	struct xenvif_sgrant *grant = xenvif_get_sgrant(queue, ref);
-	grant_handle_t handle = !grant ? NETBACK_INVALID_HANDLE : grant->handle;
+	struct xenvif_sgrant *sgrant = xenvif_get_sgrant(queue, ref);
+	grant_handle_t handle = !sgrant ? NETBACK_INVALID_HANDLE : sgrant->handle;
 
 	if (unlikely(queue->tx_sgrants[pending_idx])) {
 		netdev_err(queue->vif->dev,
@@ -295,8 +287,8 @@ static bool xenvif_tx_sgrant(struct xenvif_queue *queue, grant_ref_t ref,
 		BUG();
 	}
 	xenvif_grant_handle_set(queue, pending_idx, handle);
-	queue->tx_sgrants[pending_idx] = grant;
-	return !!grant;
+	queue->tx_sgrants[pending_idx] = sgrant;
+	return !!sgrant;
 }
 
 static int xenvif_count_requests(struct xenvif_queue *queue,
@@ -479,6 +471,8 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 		int amount = data_len > txp->size ? txp->size : data_len;
 		bool split = false;
 
+		// TODO memcpy directly if the gref is static
+
 		cop->source.u.ref = txp->gref;
 		cop->source.domid = queue->vif->domid;
 		cop->source.offset = txp->offset;
@@ -659,7 +653,7 @@ check_frags:
 
 		pending_idx = frag_get_pending_idx(&shinfo->frags[i]);
 
-		/* Skip the fragment if it's already in the mapping table */
+		/* Skip fragments covered by static grants. */
 		if (!err && queue->tx_sgrants[pending_idx])
 			continue;
 
@@ -700,13 +694,20 @@ check_frags:
 		xenvif_idx_release(queue, pending_idx, XEN_NETIF_RSP_ERROR);
 
 		/* Not the first error? Preceding frags already invalidated. */
-		if (err)
+		if (err) {
+			gop_map++;
 			continue;
+		}
 
 		/* Invalidate preceding fragments of this skb. */
 		for (j = 0; j < i; j++) {
 			pending_idx = frag_get_pending_idx(&shinfo->frags[j]);
-			xenvif_tx_sgrant_release(queue, pending_idx);
+			if (queue->tx_sgrants[pending_idx])
+				xenvif_tx_sgrant_reset(queue, pending_idx);
+			else
+				xenvif_idx_unmap(queue, pending_idx);
+			xenvif_idx_release(queue, pending_idx,
+					XEN_NETIF_RSP_OKAY);
 		}
 
 		/* And if we found the error while checking the frag_list, unmap
@@ -715,7 +716,12 @@ check_frags:
 		if (first_shinfo) {
 			for (j = 0; j < first_shinfo->nr_frags; j++) {
 				pending_idx = frag_get_pending_idx(&first_shinfo->frags[j]);
-				xenvif_tx_sgrant_release(queue, pending_idx);
+				if (queue->tx_sgrants[pending_idx])
+					xenvif_tx_sgrant_reset(queue, pending_idx);
+				else
+					xenvif_idx_unmap(queue, pending_idx);
+				xenvif_idx_release(queue, pending_idx,
+						XEN_NETIF_RSP_OKAY);
 			}
 		}
 
@@ -746,7 +752,7 @@ static void xenvif_fill_frags(struct xenvif_queue *queue, struct sk_buff *skb)
 	for (i = 0; i < nr_frags; i++) {
 		skb_frag_t *frag = shinfo->frags + i;
 		struct xen_netif_tx_request *txp;
-		struct xenvif_sgrant *grant;
+		struct xenvif_sgrant *sgrant;
 		struct page *page;
 		u16 pending_idx;
 
@@ -764,8 +770,8 @@ static void xenvif_fill_frags(struct xenvif_queue *queue, struct sk_buff *skb)
 		prev_pending_idx = pending_idx;
 
 		txp = &queue->pending_tx_info[pending_idx].req;
-		grant = queue->tx_sgrants[pending_idx];
-		page = (grant ? grant->page :
+		sgrant = queue->tx_sgrants[pending_idx];
+		page = (sgrant ? sgrant->page :
 			virt_to_page((void *)idx_to_kaddr(queue, pending_idx)));
 		__skb_fill_page_desc(skb, i, page, txp->offset, txp->size);
 		skb->len += txp->size;
@@ -1353,7 +1359,9 @@ static void xenvif_zerocopy_callback(struct sk_buff *skb,
 		u16 pending_idx = ubuf->desc;
 		ubuf = (struct ubuf_info_msgzc *) ubuf->ctx;
 		if (queue->tx_sgrants[pending_idx]) {
-			xenvif_tx_sgrant_release(queue, pending_idx);
+			xenvif_tx_sgrant_reset(queue, pending_idx);
+			xenvif_idx_release(queue, pending_idx,
+				   XEN_NETIF_RSP_OKAY);
 			continue;
 		}
 		BUG_ON(queue->dealloc_prod - queue->dealloc_cons >=
