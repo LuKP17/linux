@@ -2914,33 +2914,37 @@ static int xennet_connect(struct net_device *dev)
 		notify_remote_via_irq(queue->tx_irq);
 		if (queue->tx_irq != queue->rx_irq)
 			notify_remote_via_irq(queue->rx_irq);
-
-		spin_lock_bh(&queue->rx_lock);
-		xennet_alloc_rx_buffers(queue);
-		spin_unlock_bh(&queue->rx_lock);
+		if (!xennet_static_grants) {
+			spin_lock_bh(&queue->rx_lock);
+			xennet_alloc_rx_buffers(queue);
+			spin_unlock_bh(&queue->rx_lock);
+		}
 	}
 
 	return 0;
 }
 
 /*
- * Runs when backend is connected.
+ * Runs when the control ring is ready.
  */
-static void xennet_connected(struct net_device *dev)
+static void xennet_control_connected(struct net_device *dev)
 {
 	struct netfront_info *np = netdev_priv(dev);
+	struct netfront_queue *queue;
 	unsigned int max_grefs, i;
 	unsigned int num_queues = dev->real_num_tx_queues;
 
-	/* No control ring or static grants disabled */
-	if (np->ctrl_ring_ref == INVALID_GRANT_REF || !xennet_static_grants) 
-		return;
-
-	for (i = 0; i < num_queues; i++) {
-		max_grefs = xennet_get_gref_map_size(&np->queues[i]);
-		if (!max_grefs)
-			return;    /* Backend doesn't support static grants */
-		setup_static_grants(np->xbdev, &np->queues[i], max_grefs);
+	if (xennet_static_grants) {
+		for (i = 0; i < num_queues; i++) {
+			queue = &np->queues[i];
+			max_grefs = xennet_get_gref_map_size(queue);
+			if (max_grefs)
+				setup_static_grants(np->xbdev, queue, max_grefs);
+			/* Deferred providing RX slots to use static grants */
+			spin_lock_bh(&queue->rx_lock);
+			xennet_alloc_rx_buffers(queue);
+			spin_unlock_bh(&queue->rx_lock);
+		}
 	}
 }
 
@@ -2974,7 +2978,8 @@ static void netback_changed(struct xenbus_device *dev,
 		break;
 
 	case XenbusStateConnected:
-		xennet_connected(netdev);
+		if (np->ctrl_ring_ref != INVALID_GRANT_REF)
+			xennet_control_connected(netdev);
 		netdev_notify_peers(netdev);
 		break;
 
