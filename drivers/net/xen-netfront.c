@@ -82,6 +82,7 @@ static const struct ethtool_ops xennet_ethtool_ops;
 
 struct netfront_cb {
 	int pull_to;
+	u16 grant_idx;
 };
 
 #define NETFRONT_SKB_CB(skb)	((struct netfront_cb *)((skb)->cb))
@@ -178,6 +179,22 @@ struct netfront_queue {
 
 	/* Static grants */
 	struct netfront_buffer_info tx_binfo, rx_binfo;
+
+	/* Stores indices of free RX static grants */
+	u16 free_ring[NET_RX_RING_SIZE];
+	unsigned int free_cons; /* Points to the first free grant */
+	unsigned int free_prod; /* Points after the last free grant */
+
+	/* Zerocopy callback structures
+	 * desc contains a static grant index to be put in free_ring. It is initialized in
+	 * setup_static_grants and it never changes.
+	 * skb_shinfo(skb)->destructor_arg points to the first mapped slot's
+	 * callback_struct, then ctx to the next, or NULL if there is no more slot
+	 * for this skb.
+	 */
+	struct ubuf_info_msgzc callback_struct[NET_RX_RING_SIZE];
+	/* This prevents zerocopy callbacks to race over free_ring */
+	spinlock_t callback_lock;
 
 	unsigned int rx_rsp_unconsumed;
 	spinlock_t rx_cons_lock;
@@ -321,8 +338,17 @@ static struct sk_buff *xennet_alloc_one_rx_buffer(struct netfront_queue *queue)
 	if (unlikely(!skb))
 		return NULL;
 
-	page = page_pool_alloc_pages(queue->page_pool,
-				     GFP_ATOMIC | __GFP_NOWARN | __GFP_ZERO);
+	if (queue->rx_binfo.count) {
+		/* Use a free static grant page */
+		unsigned int index = xennet_rxidx(queue->free_cons);
+		u16 grant_idx = queue->free_ring[index];
+		page = queue->rx_binfo.bufs[grant_idx].page;
+		queue->free_cons++;
+		NETFRONT_SKB_CB(skb)->grant_idx = grant_idx;
+	} else {
+		page = page_pool_alloc_pages(queue->page_pool,
+					GFP_ATOMIC | __GFP_NOWARN | __GFP_ZERO);
+	}
 	if (unlikely(!page)) {
 		kfree_skb(skb);
 		return NULL;
@@ -333,6 +359,9 @@ static struct sk_buff *xennet_alloc_one_rx_buffer(struct netfront_queue *queue)
 	/* Align ip header to a 16 bytes boundary */
 	skb_reserve(skb, NET_IP_ALIGN);
 	skb->dev = queue->info->netdev;
+
+	/* Initialize it here to avoid later surprises */
+	skb_shinfo(skb)->destructor_arg = NULL;
 
 	return skb;
 }
@@ -367,17 +396,23 @@ static void xennet_alloc_rx_buffers(struct netfront_queue *queue)
 		BUG_ON(queue->rx_skbs[id]);
 		queue->rx_skbs[id] = skb;
 
-		ref = gnttab_claim_grant_reference(&queue->gref_rx_head);
-		WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
+		if (queue->rx_binfo.count) {
+			/* Use static grant gref */
+			u16 grant_idx = NETFRONT_SKB_CB(skb)->grant_idx;
+			ref = queue->rx_binfo.bufs[grant_idx].ref;
+		} else {
+			ref = gnttab_claim_grant_reference(&queue->gref_rx_head);
+			WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
+
+			page = skb_frag_page(&skb_shinfo(skb)->frags[0]);
+			gnttab_page_grant_foreign_access_ref_one(ref,
+								queue->info->xbdev->otherend_id,
+								page,
+								0);
+		}
 		queue->grant_rx_ref[id] = ref;
 
-		page = skb_frag_page(&skb_shinfo(skb)->frags[0]);
-
 		req = RING_GET_REQUEST(&queue->rx, req_prod);
-		gnttab_page_grant_foreign_access_ref_one(ref,
-							 queue->info->xbdev->otherend_id,
-							 page,
-							 0);
 		req->id = id;
 		req->gref = ref;
 	}
@@ -1144,15 +1179,16 @@ static int xennet_get_responses(struct netfront_queue *queue,
 			goto next;
 		}
 
-		if (!gnttab_end_foreign_access_ref(ref)) {
-			dev_alert(dev,
-				  "Grant still in use by backend domain\n");
-			queue->info->broken = true;
-			dev_alert(dev, "Disabled for further use\n");
-			return -EINVAL;
+		if (!queue->rx_binfo.count) {
+			if (!gnttab_end_foreign_access_ref(ref)) {
+				dev_alert(dev,
+					"Grant still in use by backend domain\n");
+				queue->info->broken = true;
+				dev_alert(dev, "Disabled for further use\n");
+				return -EINVAL;
+			}
+			gnttab_release_grant_reference(&queue->gref_rx_head, ref);
 		}
-
-		gnttab_release_grant_reference(&queue->gref_rx_head, ref);
 
 		rcu_read_lock();
 		xdp_prog = rcu_dereference(queue->xdp_prog);
@@ -1238,6 +1274,20 @@ static int xennet_fill_frags(struct netfront_queue *queue,
 {
 	RING_IDX cons = queue->rx.rsp_cons;
 	struct sk_buff *nskb;
+	u16 prev_grant_idx, grant_idx;
+
+	/* the grant index will be represented by ubuf->desc
+	 * assign the first FE skb (used to reconstruct BE skb) destructor_arg to the
+	 * callback_struct which desc is the index of the static grant used for its frag
+	 */
+	if (queue->rx_binfo.count) {
+		grant_idx = NETFRONT_SKB_CB(skb)->grant_idx;
+		queue->callback_struct[grant_idx].ctx = NULL;
+		skb_shinfo(skb)->destructor_arg =
+			&queue->callback_struct[grant_idx];
+		prev_grant_idx = grant_idx;
+		get_page(skb_frag_page(&skb_shinfo(skb)->frags[0]));
+	}
 
 	while ((nskb = __skb_dequeue(list))) {
 		struct xen_netif_rx_response rx;
@@ -1256,6 +1306,16 @@ static int xennet_fill_frags(struct netfront_queue *queue,
 					       ++cons + skb_queue_len(list));
 			kfree_skb(nskb);
 			return -ENOENT;
+		}
+
+		/* chain ubufs together to remember the static grants used for each nskb frag */
+		if (queue->rx_binfo.count) {
+			grant_idx = NETFRONT_SKB_CB(nskb)->grant_idx;
+			queue->callback_struct[grant_idx].ctx = NULL;
+			queue->callback_struct[prev_grant_idx].ctx =
+				&queue->callback_struct[grant_idx];
+			prev_grant_idx = grant_idx;
+			get_page(skb_frag_page(nfrag));
 		}
 
 		skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
@@ -1319,17 +1379,59 @@ static int handle_incoming_queue(struct netfront_queue *queue,
 			continue;
 		}
 
+		if (skb_shinfo(skb)->destructor_arg)
+			skb_shinfo(skb)->flags |= SKBFL_ZEROCOPY_ENABLE;
+
 		u64_stats_update_begin(&rx_stats->syncp);
 		rx_stats->packets++;
 		rx_stats->bytes += skb->len;
 		u64_stats_update_end(&rx_stats->syncp);
 
 		/* Pass it up. */
-		napi_gro_receive(&queue->napi, skb);
+		netif_receive_skb(skb);
 	}
 
 	return packets_dropped;
 }
+
+/* Find the containing queue structure from a pointer in callback_struct array
+ */
+static inline struct netfront_queue *ubuf_to_queue(const struct ubuf_info_msgzc *ubuf)
+{
+	u16 grant_idx = ubuf->desc;
+	return container_of(ubuf - grant_idx,
+			    struct netfront_queue,
+			    callback_struct[0]);
+}
+
+static void xennet_zerocopy_callback(struct sk_buff *skb,
+				     struct ubuf_info *ubuf_base,
+				     bool zerocopy_success)
+{
+	unsigned long flags;
+	unsigned int index;
+	struct ubuf_info_msgzc *ubuf = uarg_to_msgzc(ubuf_base);
+	struct netfront_queue *queue = ubuf_to_queue(ubuf);
+
+	/* This is the only place where we grab this lock, to protect callbacks
+	 * from each other.
+	 */
+	spin_lock_irqsave(&queue->callback_lock, flags);
+	do {
+		u16 grant_idx = ubuf->desc;
+		ubuf = (struct ubuf_info_msgzc *) ubuf->ctx;
+		BUG_ON(queue->free_prod - queue->free_cons >=
+			NET_RX_RING_SIZE);
+		index = xennet_rxidx(queue->free_prod);
+		queue->free_ring[index] = grant_idx;
+		queue->free_prod++;
+	} while (ubuf);
+	spin_unlock_irqrestore(&queue->callback_lock, flags);
+}
+
+const struct ubuf_info_ops xennet_ubuf_ops = {
+	.complete = xennet_zerocopy_callback,
+};
 
 static int xennet_poll(struct napi_struct *napi, int budget)
 {
@@ -2549,6 +2651,7 @@ static void setup_static_grants(struct xenbus_device *dev,
 				 unsigned int max_grefs)
 {
 	int err;
+	unsigned int i;
 
 	if (max_grefs < NET_RX_RING_SIZE) {
 		if (max_grefs >= NET_TX_RING_SIZE)
@@ -2565,6 +2668,17 @@ static void setup_static_grants(struct xenbus_device *dev,
 			 queue->id);
 		return;
 	}
+
+	for (i = 0; i < queue->rx_binfo.count; i++) {
+		queue->free_ring[i] = i;
+		queue->callback_struct[i] = (struct ubuf_info_msgzc)
+			{ { .ops = &xennet_ubuf_ops },
+			  { { .ctx = NULL,
+			      .desc = i } } };
+	}
+	queue->free_cons = 0;
+	queue->free_prod = queue->rx_binfo.count;
+	spin_lock_init(&queue->callback_lock);
 
 	pr_info("network RX static grants initialized");
 
