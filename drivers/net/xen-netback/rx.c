@@ -161,7 +161,8 @@ static void xenvif_rx_copy_flush(struct xenvif_queue *queue)
 	unsigned int i;
 	int notify;
 
-	gnttab_batch_copy(queue->rx_copy.op, queue->rx_copy.num);
+	if (queue->rx_copy.num)
+		gnttab_batch_copy(queue->rx_copy.op, queue->rx_copy.num);
 
 	for (i = 0; i < queue->rx_copy.num; i++) {
 		struct gnttab_copy *op;
@@ -192,11 +193,17 @@ static void xenvif_rx_copy_flush(struct xenvif_queue *queue)
 
 static void xenvif_rx_copy_add(struct xenvif_queue *queue,
 			       struct xen_netif_rx_request *req,
-			       unsigned int offset, void *data, size_t len)
+			       unsigned int offset, void *data, size_t len,
+			       struct xenvif_sgrant *sgrant)
 {
 	struct gnttab_copy *op;
 	struct page *page;
 	struct xen_page_foreign *foreign;
+
+	if (sgrant && !(sgrant->flags & GNTMAP_readonly)) {
+		memcpy(page_address(sgrant->page) + offset, data, len);
+		return;
+	}
 
 	if (queue->rx_copy.num == COPY_BATCH_SIZE)
 		xenvif_rx_copy_flush(queue);
@@ -397,13 +404,16 @@ static void xenvif_rx_data_slot(struct xenvif_queue *queue,
 {
 	unsigned int offset = queue->vif->xdp_headroom;
 	unsigned int flags;
+	struct xenvif_sgrant *sgrant;
+
+	sgrant = xenvif_get_sgrant(queue, req->gref);
 
 	do {
 		size_t len;
 		void *data;
 
 		xenvif_rx_next_chunk(queue, pkt, offset, &data, &len);
-		xenvif_rx_copy_add(queue, req, offset, data, len);
+		xenvif_rx_copy_add(queue, req, offset, data, len, sgrant);
 
 		offset += len;
 		pkt->remaining_len -= len;
@@ -427,6 +437,9 @@ static void xenvif_rx_data_slot(struct xenvif_queue *queue,
 		if (pkt->extra_count != 0)
 			flags |= XEN_NETRXF_extra_info;
 	}
+
+	if (sgrant)
+		xenvif_put_sgrant(queue, sgrant);
 
 	rsp->offset = 0;
 	rsp->flags = flags;
